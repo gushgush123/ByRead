@@ -399,7 +399,11 @@ ByRead/
 | 阅读页只有摘要 | 那个网站拦截了自动抓取，点"打开原文"，或点"再试一次提取" |
 | 想换订阅服务实例 | 设置页 → 高级 → 检测，挑一个可用的 |
 | 想从头再来 | 关掉程序，删掉 `instance` 文件夹，重新启动 |
+| 第一次启动时抓不到文章 | 确认网络能访问那些网站；首次抓取是后台跑的，看工具栏的进度条 |
+| `git push` 报 `SSL certificate ... unable to get local issuer certificate` | Windows 上 git 的 OpenSSL 证书后端异常（实测：即使证书包完好也会报）。执行 `git config --global http.sslBackend schannel` 改用 Windows 系统证书库即可 |
+| 双击 `start.bat` 一闪而过 | 用命令行 `cd /d 项目目录` 然后敲 `start.bat`，就能看到具体报错 |
+| 中文在命令行窗口里显示成乱码 | `start.bat` 是 GBK 编码的，请用系统默认的 cmd 运行；如果你改过控制台代码页（`chcp 65001`），先改回 `chcp 936` |
 
 ---
 
-白读 · ByRead v0.1.1-local ｜ 给自己用的本地 RSS 阅读器
+白读 · ByRead ｜ 给自己用的本地 RSS 阅读器
