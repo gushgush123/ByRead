@@ -1,0 +1,28 @@
+# ===========================================================================
+# 白读 · ByRead  .gitattributes
+#
+# 为什么需要它：start.bat 必须保持 **CRLF 行尾 + GBK 编码**。
+# 之前就是因为这个文件被写成 LF，cmd 解析错位、整个脚本跑不起来。
+# 这里显式声明 bat 用 CRLF 检出，保证任何人 clone 下来都能直接双击运行，
+# 不受对方 core.autocrlf 设置的影响。
+# ===========================================================================
+
+# 默认：自动识别文本文件，仓库里统一存 LF
+* text=auto
+
+# Windows 批处理：检出时必须是 CRLF，否则 cmd 会解析出错
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Python / 前端源码：统一 LF
+*.py   text eol=lf
+*.js   text eol=lf
+*.css  text eol=lf
+*.html text eol=lf
+*.md   text eol=lf
+
+# 第三方压缩过的库与图片：别做行尾转换，也别在 diff 里展开
+static/vendor/* -text
+*.png binary
+*.jpg binary
+*.ico binary

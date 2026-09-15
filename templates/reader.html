@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}{{ article.title if article else '文章不存在' }} · 白读{% endblock %}
+
+{% block body %}
+<header class="topbar">
+  <div class="topbar__actions">
+    <a class="icon-btn" href="/" id="btn-back">← 返回列表</a>
+  </div>
+  {% if article %}
+  <div class="topbar__actions">
+    <button class="icon-btn" id="btn-folder" title="放进收藏夹">📁 <span id="folder-label">收藏夹</span></button>
+    <button class="icon-btn" id="btn-star" title="收藏（S）">☆ 收藏</button>
+    {% if article.link %}
+    <a class="icon-btn" href="{{ article.link }}" target="_blank" rel="noopener noreferrer" title="打开原文">↗ 原文</a>
+    {% endif %}
+    <button class="icon-btn" id="btn-print" title="打印 / 导出 PDF">🖨</button>
+    <button class="icon-btn" id="btn-delete" title="删除这篇文章">🗑</button>
+  </div>
+  {% endif %}
+</header>
+
+{% if not article %}
+<main class="reader-shell">
+  <div class="empty">
+    <span class="empty__emoji">🗂</span>
+    <div class="empty__title">文章不存在或已被删除</div>
+    <div class="empty__hint"><a href="/">回到列表</a></div>
+  </div>
+</main>
+{% else %}
+<main class="reader-shell" id="reader"
+      data-article-id="{{ article.id }}"
+      data-has-content="{{ '1' if article.content else '0' }}">
+  <h1 class="reader-title">{{ article.title }}</h1>
+  <div class="reader-meta">
+    <span class="reader-meta__feed">{{ article.feed_title }}</span>
+    {% if article.author %}<span>·</span><span>{{ article.author }}</span>{% endif %}
+    <span>·</span>
+    <span data-time="{{ article.published }}">{{ article.published }}</span>
+  </div>
+
+  <article class="reader-body" id="reader-body">
+    {% if article.content %}
+      {# 服务端已清洗过一次；这里仍然经过前端 DOMPurify 二次清洗 #}
+      <div class="skeleton" style="height:120px"></div>
+    {% else %}
+      <div class="skeleton" style="height:120px"></div>
+    {% endif %}
+  </article>
+
+  <div id="reader-fallback" style="display:none">
+    <div class="reader-note" id="reader-note"></div>
+  </div>
+</main>
+
+<script id="article-summary" type="application/json">{{ (article.summary or '')|tojson }}</script>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+{% if article %}
+<script src="{{ url_for('static', filename='js/reader.js') }}"></script>
+{% endif %}
+{% endblock %}

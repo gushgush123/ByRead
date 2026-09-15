@@ -1,0 +1,24 @@
+{# 添加订阅弹窗：首页和设置页共用一份，逻辑在 common.js 里 #}
+<div class="modal-mask" id="subscribe-mask">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="subscribe-title">
+    <div class="modal__head">
+      <div class="modal__title" id="subscribe-title">添加订阅</div>
+      <button class="icon-btn" data-subscribe-close title="关闭">✕</button>
+    </div>
+    <div class="modal__body">
+      <div class="input-group">
+        <input class="input" id="subscribe-input" type="text" autocomplete="off"
+               placeholder="输入博主名、平台名，或粘贴链接…">
+        <button class="btn btn--primary" id="subscribe-search">查找</button>
+      </div>
+      <div class="field__hint" id="subscribe-hint">
+        例如：半佛仙人 / B站 半佛仙人 / 少数派 / 粘贴任意网站或博主主页链接
+      </div>
+      <div id="subscribe-results" style="margin-top:12px"></div>
+    </div>
+    <div class="modal__foot">
+      <button class="btn" data-subscribe-close>取消</button>
+      <button class="btn btn--primary" id="subscribe-add" disabled>添加</button>
+    </div>
+  </div>
+</div>

@@ -1,0 +1,232 @@
+{% extends "base.html" %}
+{% block title %}设置 · 白读{% endblock %}
+
+{% block body %}
+<header class="topbar">
+  <div class="topbar__actions">
+    <a class="icon-btn" href="/">← 返回首页</a>
+  </div>
+  <div class="topbar__title">设置</div>
+  <div class="topbar__actions">
+    <button class="icon-btn" id="btn-theme" title="切换深色 / 浅色">🌙</button>
+  </div>
+</header>
+
+<main class="settings-shell">
+
+  <!-- ============ 订阅管理 ============ -->
+  <section class="section">
+    <h2 class="section__title">订阅管理</h2>
+    <div class="panel" id="feeds-panel">
+      <div class="panel__row"><div class="panel__main"><div class="panel__sub">加载中…</div></div></div>
+    </div>
+  </section>
+
+  <!-- ============ 添加订阅 ============ -->
+  <section class="section">
+    <h2 class="section__title">添加订阅</h2>
+    <div class="field">
+      <div class="input-group">
+        <input class="input" id="add-input" type="text" autocomplete="off"
+               placeholder="输入博主名、平台名，或粘贴链接…">
+        <button class="btn btn--primary" id="add-btn">查找并添加</button>
+      </div>
+      <div class="field__hint">
+        全程不需要知道"订阅地址"是什么：输入名字我来找，或者直接粘贴博主主页 / 网站链接。
+      </div>
+    </div>
+    <div class="field__label">推荐订阅源（点一下即可添加）</div>
+    <div class="chips" id="preset-chips"></div>
+  </section>
+
+  <!-- ============ 登录信息 ============ -->
+  <section class="section">
+    <h2 class="section__title">登录信息（可选）</h2>
+    <div class="field">
+      <div class="modal__hint" style="margin-bottom:12px">
+        配置之后，知乎和微博也能像 B 站一样"输入名字就订阅"。不配置也能用，只是这两个平台
+        需要粘贴主页链接。<br>
+        <b>登录信息只存在你自己电脑的数据库里，只会发给对应平台，不会上传到任何其他地方。</b>
+      </div>
+
+      <details style="margin-bottom:16px">
+        <summary style="cursor:pointer;font-size:14px;color:var(--accent)">怎么获取？（点开看三步）</summary>
+        <ol class="field__hint" style="padding-left:20px;line-height:1.9">
+          <li>浏览器里打开并<b>登录</b>目标网站（zhihu.com 或 weibo.com）。</li>
+          <li>按 <b>F12</b> 打开开发者工具 → 切到 <b>网络 / Network</b> 面板 → <b>刷新页面</b>。</li>
+          <li>在请求列表里点<b>最上面那条</b>（就是网页本身）→ 右键 → <b>复制 → 复制为 cURL</b>（Copy as cURL），
+              然后整段粘贴到下面的框里。</li>
+        </ol>
+        <div class="field__hint" style="padding-left:4px">
+          提示：一定要用"复制为 cURL"，不要用 <code>document.cookie</code> —— 关键的登录字段是
+          HttpOnly 的，只有前者能拿到。整段粘贴就行，程序会自己把需要的那部分挑出来。
+        </div>
+      </details>
+
+      <div class="field">
+        <label class="field__label">知乎</label>
+        <div class="input-group">
+          <input class="input" type="password" id="cookie-zhihu" autocomplete="off"
+                 placeholder="粘贴「复制为 cURL」的整段内容，或 Cookie 字符串">
+          <button class="btn" data-cookie-save="zhihu">保存并测试</button>
+          <button class="btn btn--ghost" data-cookie-clear="zhihu">清除</button>
+        </div>
+        <div class="field__hint" id="cookie-status-zhihu">读取中…</div>
+      </div>
+
+      <div class="field">
+        <label class="field__label">微博</label>
+        <div class="input-group">
+          <input class="input" type="password" id="cookie-weibo" autocomplete="off"
+                 placeholder="粘贴「复制为 cURL」的整段内容，或 Cookie 字符串">
+          <button class="btn" data-cookie-save="weibo">保存并测试</button>
+          <button class="btn btn--ghost" data-cookie-clear="weibo">清除</button>
+        </div>
+        <div class="field__hint" id="cookie-status-weibo">读取中…</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 收藏夹 ============ -->
+  <section class="section">
+    <h2 class="section__title">收藏夹</h2>
+    <div class="panel" id="folders-panel">
+      <div class="panel__row"><div class="panel__main"><div class="panel__sub">加载中…</div></div></div>
+    </div>
+    <div class="field" style="margin-top:12px">
+      <div class="input-group">
+        <input class="input" id="folder-name" type="text" maxlength="40"
+               placeholder="新建收藏夹，例如：待读长文 / 教程 / 素材">
+        <button class="btn btn--primary" id="folder-create">创建</button>
+      </div>
+      <div class="color-swatches" id="folder-colors"></div>
+      <div class="field__hint">
+        收藏夹可以自定义名字和颜色；在首页把文章放进收藏夹，或用阅读页的「📁」按钮。
+        删除收藏夹不会删文章，里面的文章只是回到「未分类」。
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 过滤 ============ -->
+  <section class="section">
+    <h2 class="section__title">过滤</h2>
+    <div class="field">
+      <label class="field__label" for="keywords">关键词过滤（标题包含以下词的文章会自动隐藏，用逗号分隔）</label>
+      <textarea class="textarea" id="keywords" placeholder="震惊, 突发, 重磅"></textarea>
+      <div class="field__hint">在数据库层过滤，分页数量也会同步排除，不会出现"加载了却看不到"的情况。</div>
+    </div>
+    <div style="display:flex;gap:8px"><button class="btn btn--primary btn--sm" id="keywords-save">保存关键词</button></div>
+  </section>
+
+  <!-- ============ 阅读 ============ -->
+  <section class="section">
+    <h2 class="section__title">阅读</h2>
+    <div class="panel">
+      <div class="panel__row">
+        <div class="panel__main">
+          <div class="panel__name">屏蔽文章内的图片</div>
+          <div class="panel__sub">开启后正文只保留文字，避免加载第三方图片（隐私模式）</div>
+        </div>
+        <label class="switch"><input type="checkbox" id="block-images"><span class="switch__slider"></span></label>
+      </div>
+      <div class="panel__row">
+        <div class="panel__main">
+          <div class="panel__name">每页文章数</div>
+        </div>
+        <select class="select" id="page-size" style="width:96px">
+          <option value="20">20</option>
+          <option value="30">30</option>
+          <option value="50">50</option>
+          <option value="100">100</option>
+        </select>
+      </div>
+      <div class="panel__row">
+        <div class="panel__main">
+          <div class="panel__name">自动刷新</div>
+          <div class="panel__sub">后台按间隔自动抓取新文章（关闭不影响手动刷新）</div>
+        </div>
+        <select class="select" id="auto-refresh" style="width:130px">
+          <option value="0">关闭</option>
+          <option value="15">每 15 分钟</option>
+          <option value="30">每 30 分钟</option>
+          <option value="60">每 1 小时</option>
+          <option value="180">每 3 小时</option>
+        </select>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 外观 ============ -->
+  <section class="section">
+    <h2 class="section__title">外观</h2>
+    <div class="field">
+      <div class="field__label">主题</div>
+      <div class="radio-row">
+        <label class="radio"><input type="radio" name="theme" value="light"> 浅色</label>
+        <label class="radio"><input type="radio" name="theme" value="dark"> 深色</label>
+      </div>
+    </div>
+    <div class="field">
+      <div class="field__label">列表视图</div>
+      <div class="radio-row">
+        <label class="radio"><input type="radio" name="view_mode" value="card"> 网格卡片</label>
+        <label class="radio"><input type="radio" name="view_mode" value="row"> 宽卡片</label>
+        <label class="radio"><input type="radio" name="view_mode" value="list"> 紧凑列表</label>
+      </div>
+      <div class="field__hint">
+        网格卡片是行列排布的方形卡片，带缩略图，适合快速浏览；宽卡片标题显示更完整，适合细读。
+        顶栏的 ▦ 按钮可以在三种之间循环切换。
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 数据 ============ -->
+  <section class="section">
+    <h2 class="section__title">数据</h2>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <a class="btn" href="/api/opml/export">📤 导出 OPML</a>
+      <button class="btn" id="opml-import-btn">📥 导入 OPML</button>
+      <button class="btn btn--danger" id="clear-articles">🗑 清空所有文章</button>
+    </div>
+    <input type="file" id="opml-file" accept=".opml,.xml,text/xml,text/x-opml" style="display:none">
+    <div class="field__hint">清空文章会保留订阅源；删除单个订阅源会连同它的文章一起删除。</div>
+  </section>
+
+  <!-- ============ 高级：订阅服务实例 ============ -->
+  <section class="section">
+    <h2 class="section__title">高级</h2>
+    <div class="field">
+      <label class="field__label" for="instance-input">
+        订阅服务实例（只有"其他平台"的源会用到；B 站与直连源不依赖它）
+      </label>
+      <div class="input-group">
+        <input class="input" id="instance-input" type="text" placeholder="留空 = 自动选择可用实例">
+        <button class="btn" id="instance-save">保存</button>
+        <button class="btn" id="instance-probe">检测</button>
+      </div>
+      <div class="field__hint" id="instance-status">加载中…</div>
+    </div>
+    <div class="panel" id="instance-list" style="display:none"></div>
+  </section>
+
+  <!-- ============ 关于 ============ -->
+  <section class="section">
+    <h2 class="section__title">关于</h2>
+    <div class="panel">
+      <div class="about-box">
+        <div style="font-size:15px;font-weight:600;color:var(--text)">白读 · ByRead　v0.1.0-local</div>
+        <div>给自己用的本地 RSS 阅读器：所有数据只存在你自己的电脑上，不需要登录，没有推荐流。</div>
+        <div style="margin-top:10px">数据库位置：</div>
+        <div class="mono">{{ db_path }}</div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+{% include "_subscribe_modal.html" %}
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/settings.js') }}"></script>
+{% endblock %}

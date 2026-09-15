@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+{% block title %}白读 · 全部文章{% endblock %}
+
+{% block body %}
+<div class="app{{ '' if sidebar_open else ' is-collapsed' }}" id="app">
+
+  <!-- ============ 侧边栏 ============ -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar__head">
+      <a class="sidebar__brand" href="/">📖 白读</a>
+      <button class="icon-btn sidebar__collapse" id="sidebar-collapse" title="收起侧边栏（[）">«</button>
+    </div>
+
+    <nav class="nav">
+      <button class="nav__item is-active" data-view="all">
+        <span class="nav__icon">📥</span><span class="nav__label">全部</span>
+        <span class="nav__count" id="count-all">–</span>
+      </button>
+      <button class="nav__item" data-view="unread">
+        <span class="nav__icon">📬</span><span class="nav__label">未读</span>
+        <span class="nav__count" id="count-unread">–</span>
+      </button>
+      <button class="nav__item" data-view="starred" data-folder="all">
+        <span class="nav__icon">⭐</span><span class="nav__label">星标</span>
+        <span class="nav__count" id="count-starred">–</span>
+      </button>
+    </nav>
+
+    <div class="sidebar__section">
+      <div class="sidebar__title">
+        <span>收藏夹</span>
+        <button class="sidebar__add" id="folder-new" title="新建收藏夹">＋</button>
+      </div>
+      <nav class="nav" id="folder-nav"></nav>
+    </div>
+  </aside>
+  <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
+
+  <!-- ============ 主区域 ============ -->
+  <div class="app__main">
+    <header class="topbar">
+      <button class="icon-btn" id="sidebar-toggle" title="侧边栏（[）">☰</button>
+      <div class="search-box">
+        <span class="search-box__icon">🔍</span>
+        <input type="search" id="search-input" autocomplete="off"
+               placeholder="搜索标题与正文…（按 / 聚焦）">
+        <button class="search-box__clear" id="search-clear" title="清除搜索" hidden>✕</button>
+      </div>
+      <div class="topbar__actions">
+        <button class="icon-btn" id="btn-add" title="添加订阅">＋ 添加</button>
+        <button class="icon-btn" id="btn-view-mode" title="切换卡片 / 列表视图">▤</button>
+        <a class="icon-btn" href="/settings" title="设置">⚙️</a>
+        <button class="icon-btn" id="btn-theme" title="切换深色 / 浅色">🌙</button>
+      </div>
+    </header>
+
+    <div class="toolbar">
+      <div class="toolbar__title" id="view-title">全部</div>
+      <div class="toolbar__actions">
+        <button class="btn btn--ghost btn--sm" id="btn-select" title="多选（X）">☑ 选择</button>
+        <button class="btn btn--ghost btn--sm" id="btn-read-all" title="全部标记为已读（Shift+A）">全部已读</button>
+        <button class="btn btn--ghost btn--sm" id="btn-refresh" title="刷新所有订阅（R）">
+          <span class="ico-refresh">⟳</span> <span id="refresh-label">刷新</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- 多选操作条 -->
+    <div class="selbar" id="selbar">
+      <span class="selbar__count" id="selbar-count">已选 0 篇</span>
+      <div class="selbar__actions">
+        <button class="btn btn--sm" data-batch="read">标记已读</button>
+        <button class="btn btn--sm" data-batch="unread">标记未读</button>
+        <button class="btn btn--sm" data-batch="star">加星标</button>
+        <button class="btn btn--sm" data-batch="unstar">取消星标</button>
+        <button class="btn btn--sm" data-batch="folder">放入收藏夹</button>
+        <button class="btn btn--sm btn--danger" data-batch="delete">删除</button>
+      </div>
+      <div class="selbar__right">
+        <button class="btn btn--ghost btn--sm" id="sel-all">全选</button>
+        <button class="btn btn--ghost btn--sm" id="sel-none">退出多选</button>
+      </div>
+    </div>
+
+    <div class="progress" id="progress">
+      <span id="progress-text">正在抓取…</span>
+      <div class="progress__bar"><div class="progress__fill" id="progress-fill"></div></div>
+      <span id="progress-count">0/0</span>
+    </div>
+
+    <main class="list-wrap">
+      <div class="list" id="list"></div>
+      <div class="list-footer" id="list-footer"></div>
+    </main>
+  </div>
+</div>
+
+{% include "_subscribe_modal.html" %}
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/main.js') }}"></script>
+{% endblock %}
