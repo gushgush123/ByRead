@@ -1,5 +1,9 @@
 # 白读 · ByRead
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
+![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey)
+
 给自己用的本地 RSS 阅读器。数据全在你自己的电脑上，不需要登录，没有推荐流，没有广告。
 
 **核心体验**：你在一个输入框里输入博主名或平台名，它自己找到对应的源并开始抓文章。全程不出现"RSS""路由""订阅地址"这些词。
@@ -356,6 +360,9 @@ ByRead/
 ├── github.py              GitHub 趋势原生（官方搜索接口）
 ├── cookies.py             登录信息的收取/脱敏/校验（支持粘贴 cURL）
 ├── requirements.txt
+├── LICENSE                MIT 许可证
+├── .gitignore             排除 instance/（数据库里有登录信息，绝不能提交）
+├── .gitattributes         锁定 start.bat 为 CRLF 行尾
 ├── start.bat              双击启动（自动装依赖 + 开浏览器）
 ├── templates/
 │   ├── base.html          公共骨架（主题预置脚本在这里）
@@ -403,6 +410,28 @@ ByRead/
 | `git push` 报 `SSL certificate ... unable to get local issuer certificate` | Windows 上 git 的 OpenSSL 证书后端异常（实测：即使证书包完好也会报）。执行 `git config --global http.sslBackend schannel` 改用 Windows 系统证书库即可 |
 | 双击 `start.bat` 一闪而过 | 用命令行 `cd /d 项目目录` 然后敲 `start.bat`，就能看到具体报错 |
 | 中文在命令行窗口里显示成乱码 | `start.bat` 是 GBK 编码的，请用系统默认的 cmd 运行；如果你改过控制台代码页（`chcp 65001`），先改回 `chcp 936` |
+
+---
+
+## 十一、许可证
+
+本项目采用 **MIT License**，详见 [LICENSE](LICENSE)。
+
+简单说：**你可以随便用、改、分发、甚至拿去卖**，只要保留版权声明和许可证文本。
+软件按"现状"提供，作者不承担任何责任。
+
+### 第三方组件
+
+| 组件 | 用途 | 许可证 |
+|---|---|---|
+| [DOMPurify](https://github.com/cure53/DOMPurify) | 前端 HTML 清洗（已本地化到 `static/vendor/`） | Apache-2.0 或 MPL-2.0（双许可） |
+| Flask | Web 框架 | BSD-3-Clause |
+| feedparser | RSS/Atom 解析 | BSD-2-Clause |
+| lxml / readability-lxml | HTML 解析与正文提取 | BSD-3-Clause / Apache-2.0 |
+| requests | HTTP 请求 | Apache-2.0 |
+
+`static/vendor/purify.min.js` 是随本项目一起分发的第三方文件，其版权归原作者所有，
+遵循其自身的许可证。
 
 ---
 
