@@ -290,6 +290,221 @@
     ui.mask.classList.add('is-open');
   };
 
+  /* ---------------- 频道（把订阅源分组） ---------------- */
+  ByRead.channels = [];
+
+  ByRead.loadChannels = async function () {
+    const data = await ByRead.api('GET', '/api/channels');
+    ByRead.channels = data.channels || [];
+    if (data.colors && data.colors.length) ByRead.folderColors = data.colors;
+    return ByRead.channels;
+  };
+
+  ByRead.channelById = function (id) {
+    return ByRead.channels.filter(function (c) { return c.id === id; })[0] || null;
+  };
+
+  function buildChannelModal() {
+    const mask = document.createElement('div');
+    mask.className = 'modal-mask';
+    mask.id = 'channel-mask';
+    const modal = document.createElement('div');
+    modal.className = 'modal';
+
+    const head = document.createElement('div');
+    head.className = 'modal__head';
+    const title = document.createElement('div');
+    title.className = 'modal__title';
+    const close = document.createElement('button');
+    close.className = 'icon-btn';
+    close.textContent = '✕';
+    close.addEventListener('click', function () { mask.classList.remove('is-open'); });
+    head.appendChild(title);
+    head.appendChild(close);
+
+    const body = document.createElement('div');
+    body.className = 'modal__body';
+    const foot = document.createElement('div');
+    foot.className = 'modal__foot';
+
+    modal.appendChild(head);
+    modal.appendChild(body);
+    modal.appendChild(foot);
+    mask.appendChild(modal);
+    mask.addEventListener('click', function (e) {
+      if (e.target === mask) mask.classList.remove('is-open');
+    });
+    document.body.appendChild(mask);
+    return { mask: mask, title: title, body: body, foot: foot };
+  }
+
+  /**
+   * 新建 / 编辑频道弹窗。
+   * opts: { channel: 要编辑的频道（不传 = 新建）, onSaved(channels) }
+   */
+  ByRead.editChannel = async function (opts) {
+    opts = opts || {};
+    const editing = opts.channel || null;
+    const ui = document.getElementById('channel-mask') ? {
+      mask: document.getElementById('channel-mask'),
+      title: document.getElementById('channel-mask').querySelector('.modal__title'),
+      body: document.getElementById('channel-mask').querySelector('.modal__body'),
+      foot: document.getElementById('channel-mask').querySelector('.modal__foot'),
+    } : buildChannelModal();
+
+    let feeds = [];
+    try {
+      feeds = (await ByRead.api('GET', '/api/feeds')).feeds || [];
+    } catch (err) {
+      ByRead.toast(err.message, 'error');
+      return;
+    }
+
+    let color = (editing && editing.color) || ByRead.folderColors[0];
+    const chosen = new Set((editing && editing.feed_ids) || []);
+    ui.title.textContent = editing ? '编辑频道' : '新建频道';
+    ui.body.innerHTML = '';
+    ui.foot.innerHTML = '';
+
+    // 名字
+    const nameField = document.createElement('div');
+    nameField.className = 'field';
+    const nameLabel = document.createElement('label');
+    nameLabel.className = 'field__label';
+    nameLabel.textContent = '频道名字';
+    const nameInput = document.createElement('input');
+    nameInput.className = 'input';
+    nameInput.maxLength = 40;
+    nameInput.placeholder = '例如：体育 / 科技 / 每日必读';
+    nameInput.value = (editing && editing.name) || '';
+    nameField.appendChild(nameLabel);
+    nameField.appendChild(nameInput);
+    ui.body.appendChild(nameField);
+
+    // 颜色
+    const colorField = document.createElement('div');
+    colorField.className = 'field';
+    const colorLabel = document.createElement('div');
+    colorLabel.className = 'field__label';
+    colorLabel.textContent = '颜色';
+    const swatches = document.createElement('div');
+    swatches.className = 'color-swatches';
+    function paintSwatches() {
+      swatches.innerHTML = '';
+      ByRead.folderColors.forEach(function (c) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'swatch' + (c === color ? ' is-active' : '');
+        b.style.background = c;
+        b.addEventListener('click', function () { color = c; paintSwatches(); });
+        swatches.appendChild(b);
+      });
+    }
+    paintSwatches();
+    colorField.appendChild(colorLabel);
+    colorField.appendChild(swatches);
+    ui.body.appendChild(colorField);
+
+    // 订阅源多选
+    const feedsField = document.createElement('div');
+    feedsField.className = 'field';
+    const feedsLabel = document.createElement('div');
+    feedsLabel.className = 'field__label';
+    const counter = document.createElement('span');
+    const updateCounter = function () {
+      feedsLabel.textContent = '包含哪些订阅源（已选 ' + chosen.size + ' 个）';
+    };
+    updateCounter();
+    feedsField.appendChild(feedsLabel);
+    const list = document.createElement('div');
+    list.className = 'feed-picker';
+    feeds.forEach(function (f) {
+      const row = document.createElement('label');
+      row.className = 'feed-picker__row';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = chosen.has(f.id);
+      cb.addEventListener('change', function () {
+        if (cb.checked) chosen.add(f.id);
+        else chosen.delete(f.id);
+        updateCounter();
+      });
+      const icon = document.createElement('span');
+      icon.className = 'feed-picker__icon';
+      icon.textContent = (f.title || '源').trim().slice(0, 1);
+      const name = document.createElement('span');
+      name.className = 'feed-picker__name';
+      name.textContent = f.title || f.feed_url;
+      const count = document.createElement('span');
+      count.className = 'feed-picker__count';
+      count.textContent = f.article_count + ' 篇';
+      row.appendChild(cb);
+      row.appendChild(icon);
+      row.appendChild(name);
+      row.appendChild(count);
+      list.appendChild(row);
+    });
+    feedsField.appendChild(list);
+    ui.body.appendChild(feedsField);
+
+    // 底部按钮
+    if (editing) {
+      const del = document.createElement('button');
+      del.className = 'btn btn--danger';
+      del.textContent = '删除频道';
+      del.style.marginRight = 'auto';
+      del.addEventListener('click', async function () {
+        if (!confirm('删除频道「' + editing.name + '」？\n订阅源和文章都不会被删除，只是解除分组。')) return;
+        try {
+          await ByRead.api('DELETE', '/api/channels/' + editing.id);
+          ByRead.channels = (await ByRead.loadChannels()) || ByRead.channels;
+          ui.mask.classList.remove('is-open');
+          ByRead.toast('频道已删除', 'ok');
+          if (opts.onSaved) opts.onSaved(ByRead.channels, null);
+        } catch (err) {
+          ByRead.toast(err.message, 'error');
+        }
+      });
+      ui.foot.appendChild(del);
+    }
+
+    const cancel = document.createElement('button');
+    cancel.className = 'btn';
+    cancel.textContent = '取消';
+    cancel.addEventListener('click', function () { ui.mask.classList.remove('is-open'); });
+    const save = document.createElement('button');
+    save.className = 'btn btn--primary';
+    save.textContent = editing ? '保存' : '创建';
+    save.addEventListener('click', async function () {
+      const name = (nameInput.value || '').trim();
+      if (!name) {
+        ByRead.toast('给频道起个名字', 'error');
+        nameInput.focus();
+        return;
+      }
+      const payload = { name: name, color: color, feed_ids: Array.from(chosen) };
+      try {
+        const data = editing
+          ? await ByRead.api('POST', '/api/channels/' + editing.id, payload)
+          : await ByRead.api('POST', '/api/channels', payload);
+        ByRead.channels = data.channels || ByRead.channels;
+        ui.mask.classList.remove('is-open');
+        ByRead.toast(editing ? '频道已保存' : ('已创建频道「' + name + '」'), 'ok');
+        if (opts.onSaved) opts.onSaved(ByRead.channels, data.channel);
+      } catch (err) {
+        ByRead.toast(err.message, 'error');
+      }
+    });
+    ui.foot.appendChild(cancel);
+    ui.foot.appendChild(save);
+
+    ui.mask.classList.add('is-open');
+    setTimeout(function () { nameInput.focus(); }, 30);
+    nameInput.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') save.click();
+    });
+  };
+
   ByRead.debounce = function (fn, wait) {
     let timer = null;
     return function () {

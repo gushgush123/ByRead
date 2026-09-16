@@ -328,6 +328,7 @@ def _current_view() -> str:
 def api_articles():
     view = _current_view()
     feed_id = request.args.get("feed_id", type=int)
+    channel = request.args.get("channel", type=int)
     cursor = request.args.get("cursor")
     query = (request.args.get("q") or "").strip() or None
     folder = (request.args.get("folder") or "").strip() or None
@@ -335,21 +336,24 @@ def api_articles():
     keywords = db.get_filter_keywords()
 
     data = db.get_articles(view=view, feed_id=feed_id, keywords=keywords,
-                           limit=limit, cursor=cursor, query=query, folder=folder)
+                           limit=limit, cursor=cursor, query=query, folder=folder,
+                           channel=channel)
     total = db.count_articles(view=view, feed_id=feed_id, keywords=keywords,
-                              query=query, folder=folder)
+                              query=query, folder=folder, channel=channel)
     # 有多少篇是被"关键词过滤"藏起来的 —— 前端拿它做个提示，
     # 免得用户看到"来源写着 16 篇、点进去只有 13 篇"时一头雾水
     hidden = 0
     if keywords:
         hidden = max(0, db.count_articles(view=view, feed_id=feed_id, keywords=None,
-                                         query=query, folder=folder) - total)
+                                         query=query, folder=folder,
+                                         channel=channel) - total)
     return jsonify(
         {
             **data,
             "view": view,
             "query": query,
             "folder": folder,
+            "channel": channel,
             "counts": db.get_counts(keywords=keywords),
             "total": total,
             "hidden_by_filter": hidden,
@@ -537,6 +541,51 @@ def api_batch_articles():
         "counts": db.get_counts(),
         "folders": db.get_folders(),
     })
+
+
+# --------------------------------------------------------------------------- #
+# 频道（把订阅源分组）
+# --------------------------------------------------------------------------- #
+@app.get("/api/channels")
+def api_channels():
+    return jsonify({"channels": db.get_channels(), "colors": db.FOLDER_COLORS})
+
+
+@app.post("/api/channels")
+def api_create_channel():
+    payload = request.get_json(silent=True) or {}
+    name = (payload.get("name") or "").strip()
+    if not name:
+        return jsonify({"ok": False, "error": "给频道起个名字"}), 400
+    color = (payload.get("color") or db.FOLDER_COLORS[0]).strip()
+    feed_ids = payload.get("feed_ids") or []
+    channel_id = db.create_channel(name, color, feed_ids)
+    if not channel_id:
+        return jsonify({"ok": False, "error": "创建失败"}), 500
+    log.info("新建频道「%s」，包含 %s 个订阅源", name, len(feed_ids))
+    return jsonify({"ok": True, "channel": db.get_channel(channel_id),
+                    "channels": db.get_channels()})
+
+
+@app.post("/api/channels/<int:channel_id>")
+def api_update_channel(channel_id: int):
+    payload = request.get_json(silent=True) or {}
+    if not db.get_channel(channel_id):
+        return jsonify({"ok": False, "error": "频道不存在"}), 404
+    db.update_channel(channel_id, name=payload.get("name"), color=payload.get("color"))
+    if "feed_ids" in payload:
+        count = db.set_channel_feeds(channel_id, payload.get("feed_ids") or [])
+        log.info("频道 %s 更新为 %s 个订阅源", channel_id, count)
+    return jsonify({"ok": True, "channel": db.get_channel(channel_id),
+                    "channels": db.get_channels()})
+
+
+@app.delete("/api/channels/<int:channel_id>")
+def api_delete_channel(channel_id: int):
+    if not db.get_channel(channel_id):
+        return jsonify({"ok": False, "error": "频道不存在"}), 404
+    ok = db.delete_channel(channel_id)
+    return jsonify({"ok": ok, "channels": db.get_channels(), "counts": db.get_counts()})
 
 
 @app.get("/api/folders")

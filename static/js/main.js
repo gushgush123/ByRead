@@ -28,6 +28,7 @@
     folder: 'all',          // all / none / 收藏夹 id
     q: '',
     feedId: null,           // 只看某个订阅源（null = 不限）
+    channelId: null,        // 只看某个频道（null = 不限）
     feeds: [],              // 订阅源列表，用于按名字匹配（搜索"友琳"时给出"只看这个源"）
     hiddenByFilter: 0,      // 被"关键词过滤"隐藏的篇数（页脚给个交代）
     cursor: null,
@@ -101,6 +102,49 @@
     document.getElementById('count-unread').textContent = state.counts.unread;
     document.getElementById('count-starred').textContent = state.counts.starred;
 
+    // 频道（把订阅源分组）：点一下只看该频道，再点一下取消
+    const chBox = document.getElementById('channel-nav');
+    chBox.innerHTML = '';
+    ByRead.channels.forEach(function (c) {
+      const active = state.channelId === c.id;
+      const row = navItem(c.name, {
+        color: c.color,
+        count: c.unread_count || c.article_count,
+        active: active,
+        onClick: function () { setChannel(active ? null : c.id); },
+      });
+      row.title = c.name + '：' + c.feed_count + ' 个源 · 共 ' + c.article_count
+        + ' 篇 · ' + (c.unread_count || 0) + ' 篇未读';
+      // 悬停时右侧出现一个"编辑"（改名 / 换色 / 调整包含哪些源）
+      const edit = document.createElement('span');
+      edit.className = 'nav__edit';
+      edit.textContent = '✎';
+      edit.title = '编辑频道';
+      edit.addEventListener('click', function (e) {
+        e.stopPropagation();
+        ByRead.editChannel({
+          channel: c,
+          onSaved: function (channels, channel) {
+            ByRead.channels = channels || [];
+            if (!ByRead.channelById(state.channelId)) state.channelId = null;  // 频道被删了
+            renderNav();
+            renderFilterBar();
+            updateViewTitle();
+            load(true);
+          },
+        });
+      });
+      row.appendChild(edit);
+      chBox.appendChild(row);
+    });
+    if (!ByRead.channels.length) {
+      const hint = document.createElement('div');
+      hint.className = 'panel__sub';
+      hint.style.padding = '2px 12px 4px';
+      hint.textContent = '还没有频道。点上面的 ＋ 把订阅源分组，例如"体育"。';
+      chBox.appendChild(hint);
+    }
+
     // 收藏夹
     const box = document.getElementById('folder-nav');
     box.innerHTML = '';
@@ -134,6 +178,23 @@
     return state.feeds.filter(function (f) { return f.id === state.feedId; })[0] || null;
   }
 
+  function scopedChannel() {
+    if (!state.channelId) return null;
+    return ByRead.channelById(state.channelId);
+  }
+
+  /** 切换"只看某个频道"。频道是订阅源的分组，与 全部/未读/星标 可以叠加 */
+  function setChannel(channelId) {
+    state.channelId = channelId;
+    state.feedId = null;         // 频道和"单看某个源"互斥，避免两个范围打架
+    state.cursor = null;
+    updateViewTitle();
+    renderNav();
+    renderFilterBar();
+    load(true);
+    closeSidebarIfNarrow();
+  }
+
   function updateViewTitle() {
     let name;
     if (state.view === 'all') name = '全部';
@@ -144,8 +205,11 @@
       const f = ByRead.folderById(Number(state.folder));
       name = '星标 · ' + (f ? f.name : '收藏夹');
     }
+    const ch = scopedChannel();
     const scoped = scopedFeed();
-    viewTitleEl.textContent = scoped ? (name + ' · ' + scoped.title) : name;
+    if (ch) name = ch.name + ' 频道 · ' + name;
+    else if (scoped) name = name + ' · ' + scoped.title;
+    viewTitleEl.textContent = name;
   }
 
   /* ---------------- 来源筛选条 ---------------- */
@@ -160,16 +224,32 @@
   }
 
   function renderFilterBar() {
+    const ch = scopedChannel();
     const scoped = scopedFeed();
-    const matched = state.q ? matchFeeds(state.q) : [];
-    // 已经限定到某个源时就不再列候选了；否则没匹配到源就把整条收起来
-    if (!scoped && !matched.length) {
+    const matched = (state.q && !ch) ? matchFeeds(state.q) : [];
+    // 已经限定到频道/单个源时就不再列候选了；否则没匹配到源就把整条收起来
+    if (!ch && !scoped && !matched.length) {
       filterBarEl.classList.remove('is-on');
       filterBarEl.innerHTML = '';
       return;
     }
     filterBarEl.classList.add('is-on');
     filterBarEl.innerHTML = '';
+
+    if (ch) {
+      const chip = document.createElement('button');
+      chip.className = 'chip chip--folder is-active';
+      chip.appendChild(document.createTextNode(
+        '频道：' + ch.name + ' · ' + ch.feed_count + ' 个源 · ' + ch.article_count + ' 篇'));
+      const x = document.createElement('span');
+      x.className = 'chip__x';
+      x.textContent = '✕';
+      chip.appendChild(x);
+      chip.title = '退出这个频道';
+      chip.addEventListener('click', function () { setChannel(null); });
+      filterBarEl.appendChild(chip);
+      return;
+    }
 
     if (scoped) {
       const chip = document.createElement('button');
@@ -568,12 +648,14 @@
     footerEl.innerHTML = '';
     const text = document.createElement('div');
     const scope = scopedFeed();
+    const ch = scopedChannel();
     const hidden = state.hiddenByFilter || 0;
     const tail = hidden > 0
       ? '（另有 ' + hidden + ' 篇被关键词过滤隐藏）'
       : '';
-    if (state.q || scope) {
+    if (state.q || scope || ch) {
       const bits = [];
+      if (ch) bits.push('频道：' + ch.name);
       if (state.q) bits.push('搜索「' + state.q + '」');
       if (scope) bits.push('来源：' + scope.title);
       text.textContent = bits.join(' · ') + ' → 共 ' + totalOfView() + ' 篇' + tail;
@@ -729,6 +811,7 @@
         + '&limit=' + state.pageSize;
       if (state.q) url += '&q=' + encodeURIComponent(state.q);
       if (state.feedId) url += '&feed_id=' + state.feedId;
+      if (state.channelId) url += '&channel=' + state.channelId;
       if (state.view === 'starred' && state.folder !== 'all') {
         url += '&folder=' + encodeURIComponent(state.folder);
       }
@@ -872,6 +955,7 @@
         load(true);
         refreshFolders();
         loadFeeds();     // 抓完可能有新源/新篇数，刷新一下来源筛选条的计数
+        ByRead.loadChannels().then(renderNav).catch(function () {});  // 频道里的未读数也要更新
       } else {
         hideProgress();
       }
@@ -926,6 +1010,17 @@
       onPick: async function (folderId) {
         await refreshFolders();
         if (folderId) selectView('starred', String(folderId));
+      },
+    });
+  });
+
+  // 新建频道（名字 + 颜色 + 勾选包含哪些订阅源）
+  document.getElementById('channel-new').addEventListener('click', function () {
+    ByRead.editChannel({
+      onSaved: function (channels, channel) {
+        ByRead.channels = channels || [];
+        renderNav();
+        if (channel) setChannel(channel.id);
       },
     });
   });
@@ -1102,6 +1197,7 @@
   applyViewMode();
   updateViewTitle();
   ByRead.loadFolders().then(renderNav).catch(function () {});
+  ByRead.loadChannels().then(renderNav).catch(function () {});
   loadFeeds();          // 订阅源列表（用于"输入源名 → 只看这个源"）
   load(true);
   pollOnce();

@@ -684,6 +684,17 @@ button { font-family: inherit; cursor: pointer; }
 .nav__label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .nav__count { font-size: 12px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
 .nav__item.is-active .nav__count { color: var(--accent); }
+/* 悬停时才出现的"编辑"入口（频道行用） */
+.nav__edit {
+  font-size: 12px;
+  color: var(--text-muted);
+  opacity: 0;
+  padding: 0 2px;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+.nav__item:hover .nav__edit { opacity: 1; }
+.nav__edit:hover { color: var(--accent); background: var(--bg-hover); }
 .nav__dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; margin: 0 4px; }
 
 .sidebar__section { margin-top: 18px; }
@@ -869,6 +880,34 @@ body:has(.list.is-grid) { --content-max: 1080px; }
   .list.is-grid { grid-template-columns: repeat(auto-fill, minmax(148px, 1fr)); gap: 10px; }
   .list.is-grid .card__title { font-size: 13px; -webkit-line-clamp: 2; }
 }
+
+/* ---------- 频道的订阅源多选列表 ---------- */
+.feed-picker {
+  max-height: 240px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+}
+.feed-picker__row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 11px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border);
+}
+.feed-picker__row:last-child { border-bottom: none; }
+.feed-picker__row:hover { background: var(--bg-hover); }
+.feed-picker__row input { accent-color: var(--accent); width: 15px; height: 15px; flex-shrink: 0; }
+.feed-picker__icon {
+  width: 22px; height: 22px; border-radius: 6px; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--bg-card); color: var(--text-secondary);
+  font-size: 12px; font-weight: 600;
+}
+.feed-picker__name { flex: 1; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.feed-picker__count { font-size: 12px; color: var(--text-muted); flex-shrink: 0; }
 
 /* ---------- 顶栏里的搜索框 ---------- */
 .search-box {

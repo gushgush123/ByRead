@@ -182,13 +182,31 @@ CREATE TABLE IF NOT EXISTS user_actions (
     FOREIGN KEY (folder_id) REFERENCES folders(id) ON DELETE SET NULL
 );
 
--- 收藏夹：名字 + 颜色由用户自定义
+-- 收藏夹：名字 + 颜色由用户自定义（装的是**文章**）
 CREATE TABLE IF NOT EXISTS folders (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     name        TEXT NOT NULL,
     color       TEXT DEFAULT '#007AFF',
     sort_order  INTEGER DEFAULT 0,
     created_at  TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+
+-- 频道：用户自建，把**订阅源**分组（和"收藏夹装文章"是两个不同维度）
+CREATE TABLE IF NOT EXISTS channels (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    color       TEXT DEFAULT '#007AFF',
+    sort_order  INTEGER DEFAULT 0,
+    created_at  TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+
+-- 频道 ↔ 订阅源 多对多（同一个源可以同时属于"科技"和"每日必读"）
+CREATE TABLE IF NOT EXISTS channel_feeds (
+    channel_id  INTEGER NOT NULL,
+    feed_id     INTEGER NOT NULL,
+    PRIMARY KEY (channel_id, feed_id),
+    FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE,
+    FOREIGN KEY (feed_id) REFERENCES feeds(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -208,6 +226,7 @@ CREATE INDEX IF NOT EXISTS idx_articles_link       ON articles(link);
 CREATE INDEX IF NOT EXISTS idx_user_actions_read   ON user_actions(is_read);
 CREATE INDEX IF NOT EXISTS idx_user_actions_star   ON user_actions(is_starred);
 CREATE INDEX IF NOT EXISTS idx_user_actions_folder ON user_actions(folder_id);
+CREATE INDEX IF NOT EXISTS idx_channel_feeds_feed   ON channel_feeds(feed_id);
 """
 
 # 老库升级用：列不存在时才补
@@ -592,12 +611,14 @@ def _build_filters(
     keywords: Optional[Iterable[str]] = None,
     query: Optional[str] = None,
     folder: Optional[str] = None,
+    channel: Optional[int] = None,
 ) -> tuple[str, list]:
     """
     构造 WHERE 子句。
     keywords 命中标题的文章会被隐藏（在 SQL 层过滤，保证分页计数正确）。
     query   是用户主动搜索的词，跨 **来源名 / 标题 / 摘要 / 正文** 匹配。
     folder  取 "none"（未分类）或收藏夹 id。
+    channel 频道 id：只看该频道里那些订阅源的文章。
     """
     where: list[str] = ["COALESCE(a.is_deleted, 0) = 0"]   # 软删除的文章永远不出现在任何列表里
     params: list = []
@@ -605,6 +626,12 @@ def _build_filters(
     if feed_id:
         where.append("a.feed_id = ?")
         params.append(feed_id)
+
+    if channel:
+        # 频道 = 一组订阅源。用子查询做过滤，抓取后新文章自动就在频道里，
+        # 不需要任何"同步到频道"的额外逻辑
+        where.append("a.feed_id IN (SELECT feed_id FROM channel_feeds WHERE channel_id = ?)")
+        params.append(channel)
 
     if view == "unread":
         where.append("COALESCE(ua.is_read, 0) = 0")
@@ -685,6 +712,7 @@ def get_articles(
     cursor: Optional[str] = None,
     query: Optional[str] = None,
     folder: Optional[str] = None,
+    channel: Optional[int] = None,
 ) -> dict:
     """
     按发布时间倒序返回文章列表。
@@ -692,7 +720,7 @@ def get_articles(
     搜索时把"标题命中"的排在前面（相关性优先），组内仍按时间倒序。
     """
     try:
-        where, params = _build_filters(view, feed_id, keywords, query, folder)
+        where, params = _build_filters(view, feed_id, keywords, query, folder, channel)
         if cursor:
             try:
                 c_pub, c_id = cursor.rsplit("|", 1)
@@ -750,9 +778,10 @@ def get_articles(
 def count_articles(view: str = "all", feed_id: Optional[int] = None,
                    keywords: Optional[Iterable[str]] = None,
                    query: Optional[str] = None,
-                   folder: Optional[str] = None) -> int:
+                   folder: Optional[str] = None,
+                   channel: Optional[int] = None) -> int:
     try:
-        where, params = _build_filters(view, feed_id, keywords, query, folder)
+        where, params = _build_filters(view, feed_id, keywords, query, folder, channel)
         # 必须和 get_articles 用同样的 JOIN：搜索条件里可能引用 feeds 表（按来源名搜索），
         # 少了这个 JOIN 会直接 SQL 报错，而异常被吞掉后表现为"计数 0、列表却有内容"
         sql = (
@@ -1050,6 +1079,135 @@ def set_article_folder(article_id: int, folder_id: Optional[int]) -> bool:
     except Exception as exc:  # noqa: BLE001
         log.error("设置文章收藏夹 %s 失败：%s", article_id, exc)
         return False
+
+
+# --------------------------------------------------------------------------- #
+# 频道：把**订阅源**分组（和收藏夹装文章是两个维度）
+# --------------------------------------------------------------------------- #
+def get_channels() -> list[dict]:
+    """频道列表，带"包含几个源 / 共多少篇 / 多少未读"三个统计。"""
+    try:
+        sql = (
+            "SELECT c.*, "
+            "  (SELECT COUNT(*) FROM channel_feeds cf WHERE cf.channel_id = c.id) AS feed_count, "
+            "  (SELECT COUNT(*) FROM articles a "
+            "     JOIN channel_feeds cf ON cf.feed_id = a.feed_id "
+            "     WHERE cf.channel_id = c.id AND COALESCE(a.is_deleted, 0) = 0) AS article_count, "
+            "  (SELECT COUNT(*) FROM articles a "
+            "     JOIN channel_feeds cf ON cf.feed_id = a.feed_id "
+            "     LEFT JOIN user_actions ua ON ua.article_id = a.id "
+            "     WHERE cf.channel_id = c.id AND COALESCE(a.is_deleted, 0) = 0 "
+            "       AND COALESCE(ua.is_read, 0) = 0) AS unread_count "
+            "FROM channels c ORDER BY c.sort_order, c.id"
+        )
+        with get_conn() as conn:
+            rows = _rows(conn.execute(sql))
+            # 把"包含哪些订阅源"一起带上：编辑频道时要用来预勾选，
+            # 不带的话打开编辑弹窗会显示成"一个源都没选"
+            mapping: dict[int, list[int]] = {}
+            for link in conn.execute("SELECT channel_id, feed_id FROM channel_feeds"):
+                mapping.setdefault(int(link["channel_id"]), []).append(int(link["feed_id"]))
+        for row in rows:
+            row["feed_ids"] = mapping.get(int(row["id"]), [])
+        return rows
+    except Exception as exc:  # noqa: BLE001
+        log.error("读取频道失败：%s", exc)
+        return []
+
+
+def get_channel(channel_id: int) -> Optional[dict]:
+    try:
+        with get_conn() as conn:
+            row = _row(conn.execute("SELECT * FROM channels WHERE id = ?", (channel_id,)))
+        if row:
+            row["feed_ids"] = get_channel_feed_ids(channel_id)
+        return row
+    except Exception as exc:  # noqa: BLE001
+        log.error("读取频道 %s 失败：%s", channel_id, exc)
+        return None
+
+
+def get_channel_feed_ids(channel_id: int) -> list[int]:
+    try:
+        with get_conn() as conn:
+            rows = conn.execute(
+                "SELECT feed_id FROM channel_feeds WHERE channel_id = ?", (channel_id,)
+            ).fetchall()
+        return [int(r["feed_id"]) for r in rows]
+    except Exception as exc:  # noqa: BLE001
+        log.error("读取频道订阅源失败：%s", exc)
+        return []
+
+
+def create_channel(name: str, color: str = "#007AFF",
+                   feed_ids: Optional[Iterable[int]] = None) -> Optional[int]:
+    name = (name or "").strip()
+    if not name:
+        return None
+    try:
+        with get_conn() as conn:
+            row = _row(conn.execute(
+                "SELECT COALESCE(MAX(sort_order), 0) + 1 AS nxt FROM channels"))
+            cur = conn.execute(
+                "INSERT INTO channels(name, color, sort_order) VALUES (?, ?, ?)",
+                (name[:40], (color or "#007AFF")[:20], int(row["nxt"]) if row else 1),
+            )
+            channel_id = cur.lastrowid
+        if feed_ids:
+            set_channel_feeds(channel_id, feed_ids)
+        return channel_id
+    except Exception as exc:  # noqa: BLE001
+        log.error("创建频道失败：%s", exc)
+        return None
+
+
+def update_channel(channel_id: int, name: Optional[str] = None,
+                   color: Optional[str] = None) -> bool:
+    try:
+        with get_conn() as conn:
+            cur = conn.execute(
+                "UPDATE channels SET name = COALESCE(?, name), color = COALESCE(?, color) "
+                "WHERE id = ?",
+                ((name or "").strip()[:40] or None, (color or "")[:20] or None, channel_id),
+            )
+            return cur.rowcount > 0
+    except Exception as exc:  # noqa: BLE001
+        log.error("更新频道 %s 失败：%s", channel_id, exc)
+        return False
+
+
+def delete_channel(channel_id: int) -> bool:
+    """删除频道。**订阅源和文章都不受影响**，只是解除分组关系。"""
+    try:
+        with get_conn() as conn:
+            conn.execute("DELETE FROM channel_feeds WHERE channel_id = ?", (channel_id,))
+            cur = conn.execute("DELETE FROM channels WHERE id = ?", (channel_id,))
+            return cur.rowcount > 0
+    except Exception as exc:  # noqa: BLE001
+        log.error("删除频道 %s 失败：%s", channel_id, exc)
+        return False
+
+
+def set_channel_feeds(channel_id: int, feed_ids: Iterable[int]) -> int:
+    """整组替换频道里的订阅源。返回实际关联的数量。"""
+    clean: list[int] = []
+    for value in feed_ids or []:
+        try:
+            clean.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    try:
+        with get_conn() as conn:
+            conn.execute("DELETE FROM channel_feeds WHERE channel_id = ?", (channel_id,))
+            for feed_id in dict.fromkeys(clean):       # 去重且保持顺序
+                conn.execute(
+                    "INSERT OR IGNORE INTO channel_feeds(channel_id, feed_id) VALUES (?, ?)",
+                    (channel_id, feed_id),
+                )
+        return len(set(clean))
+    except Exception as exc:  # noqa: BLE001
+        log.error("设置频道订阅源失败：%s", exc)
+        return 0
 
 
 def get_article(article_id: int) -> Optional[dict]:
