@@ -30,6 +30,8 @@ from typing import Callable, Optional
 
 import requests
 
+import db
+
 log = logging.getLogger("byread.zhihu")
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -37,7 +39,7 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 TIMEOUT = 10
 DAILY_API = "https://news-at.zhihu.com/api/4"
 API = "https://www.zhihu.com/api/v4"
-MAX_FULLTEXT_PER_REFRESH = 8   # 每次刷新最多补几篇正文，避免请求过多
+MAX_FULLTEXT_PER_REFRESH = 20   # 每次刷新最多补几篇正文，避免请求过多
 
 _session = requests.Session()
 _session.headers.update({"User-Agent": UA, "Accept": "application/json"})
@@ -113,8 +115,32 @@ def _structured_html(raw) -> str:
             continue
         text = node.get("content")
         if isinstance(text, str) and text.strip():
-            parts.append(f"<p>{text}</p>")
+            # 节点里的 content 往往已经是完整的 HTML 片段（含 <p>/<a>），
+            # 再套一层 <p> 会产生嵌套段落，所以判断一下
+            if "<p" in text or "<div" in text or "<img" in text:
+                parts.append(text)
+            else:
+                parts.append(f"<p>{text}</p>")
     return "".join(parts)
+
+
+_ANSWER_LINK_RE = re.compile(r"zhihu\.com/answer/(\d+)|/answer/(\d+)")
+
+
+def _shared_answer_id(html_text: Optional[str]) -> Optional[str]:
+    """
+    想法正文里如果分享了一条回答，就把它的 id 找出来。
+
+    为什么必须这么做：知乎的"想法"转发回答时，卡片里**只有文字摘要、没有任何图片**
+    （实测：卡片 1070 字符 0 张图，而被它分享的那条回答 36581 字符 68 张图）。
+    要让这类内容显示成原文那样，就得顺着链接去取那条回答的正文。
+    """
+    if not html_text:
+        return None
+    match = _ANSWER_LINK_RE.search(html_text)
+    if not match:
+        return None
+    return match.group(1) or match.group(2)
 
 
 def _headers(cookie: Optional[str]) -> dict:
@@ -293,6 +319,11 @@ def _pin_to_entry(item: dict, user_name: str) -> Optional[dict]:
     else:
         link = f"https://www.zhihu.com/pin/{pid}"
     title_text = _strip(item.get("excerpt_title"), 80) or _strip(body_html, 60)
+    # 想法如果分享了某条回答，卡片里只有文字、没有图；记下回答 id，稍后去取那条回答的正文。
+    # 同时把"原文"直接指向回答页 —— 正文就是从那里来的，而想法页本身只有一个摘要。
+    shared = _shared_answer_id(body_html)
+    if shared:
+        link = f"https://www.zhihu.com/answer/{shared}"
     return {
         "guid": f"zhihu:pin:{pid}",
         "title": (f"[想法] {title_text}" if title_text else "[想法]")[:200],
@@ -301,6 +332,7 @@ def _pin_to_entry(item: dict, user_name: str) -> Optional[dict]:
         "link": link,
         "author": user_name,
         "published": item.get("created") or item.get("updated"),
+        "_shared_answer": shared,
     }
 
 
@@ -395,17 +427,35 @@ def fetch_user_content(
 
     for entry in entries:
         answer_id = entry.pop("_need_answer_content", None)
+        shared = entry.pop("_shared_answer", None)
+        old = state.get(entry["guid"]) or {}
+        old_len = old.get("len", 0)
+        old_link = old.get("link", "") or ""
+        old_ver = old.get("v", 0)
+        stale = old_ver < db.CONTENT_VERSION     # 正文是用旧版解析逻辑取的 → 值得重取一次
 
+        # ① 想法分享了回答：去取那条回答的全文（含图）。
+        #    "处理过"的判定 = 链接已指向该回答 且 正文版本是当前版本，两个条件都满足才跳过，
+        #    这样既不会漏（内容过时）也不会反复请求（回答本来就没图的情况）。
+        if shared and budget > 0 and (
+                stale or not old_link.endswith(f"/answer/{shared}")):
+            content = _fetch_answer_content(shared, cookie)
+            if content:
+                entry["content"] = content
+                entry["summary"] = entry.get("summary") or _strip(content, 200)
+                budget -= 1
+                time.sleep(0.2)
+                continue
+
+        # ② 正文已经是现成的（清洗一下即可）
         if entry.get("content"):
             entry["content"] = sanitize_html(entry["content"], base_url="https://www.zhihu.com/")
             if not entry.get("summary"):
                 entry["summary"] = _strip(entry["content"], 200)
             continue
 
-        if not answer_id or budget <= 0:
-            continue
-        # 库里已经有正文了就不重复取；已入库但没正文的继续补（逐次补齐）
-        if state.get(entry["guid"]):
+        # ③ 回答缺正文、或正文是旧版逻辑取的 → 重取一次
+        if not answer_id or budget <= 0 or (old_len > 0 and not stale):
             continue
 
         content = _fetch_answer_content(answer_id, cookie)
@@ -508,7 +558,8 @@ def fetch_daily(limit: int = 10, days: int = 2,
         guid = f"zhihu:daily:{sid}"
         content = ""
         cover = None
-        if not state.get(guid):
+        old = state.get(guid) or {}
+        if not old.get("len") or old.get("v", 0) < db.CONTENT_VERSION:
             detail = fetch_story(sid)
             content = detail.get("content") or ""
             cover = detail.get("image")

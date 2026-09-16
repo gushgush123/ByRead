@@ -77,6 +77,49 @@ def _is_safe_url(url: str) -> bool:
     return False
 
 
+_IMG_TAG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
+# 懒加载图片的真实地址常放在这些属性里，按优先级取（data-original 一般是最高清的原图）
+_LAZY_ATTRS = ("data-original", "data-actualsrc", "data-src", "data-lazy-src",
+               "data-echo", "data-original-src")
+
+
+def _promote_lazy_images(html_text: str) -> str:
+    """
+    把懒加载图片的真实地址搬到 src 上。
+
+    这类站点的 <img> 长这样（知乎、微博、大量新闻站都是）：
+        <img src="data:image/svg+xml;utf8,..."   ← 占位图
+             data-actualsrc="https://…/xxx_720w.jpg"
+             data-original="https://…/xxx_r.jpg">  ← 原图
+
+    src 是占位图（data: URI），会被当成"不安全地址"清理掉，整篇文章就一张图都不剩
+    （实测：知乎一条回答 68 张图全丢）。所以先搬家再清洗。
+    """
+    def fix(match) -> str:
+        tag = match.group(0)
+        real = None
+        for attr in _LAZY_ATTRS:
+            m = re.search(rf"""\s{attr}\s*=\s*["']([^"']+)["']""", tag, re.IGNORECASE)
+            if m and m.group(1).strip():
+                real = m.group(1).strip()
+                break
+        if not real:
+            return tag
+        if re.search(r"""\ssrc\s*=\s*["'][^"']*["']""", tag, re.IGNORECASE):
+            # 已经有 src：直接替换掉那一个（不能留两个 src，浏览器只认第一个）
+            tag = re.sub(r"""\ssrc\s*=\s*["'][^"']*["']""", f' src="{real}"',
+                         tag, count=1, flags=re.IGNORECASE)
+        else:
+            tag = tag[:-1] + f' src="{real}">'
+        return tag
+
+    try:
+        return _IMG_TAG_RE.sub(fix, html_text)
+    except Exception as exc:  # noqa: BLE001
+        log.info("懒加载图片地址提升失败：%s", exc)
+        return html_text
+
+
 def sanitize_html(raw_html: Optional[str], base_url: Optional[str] = None,
                   block_images: bool = False) -> str:
     """
@@ -84,6 +127,7 @@ def sanitize_html(raw_html: Optional[str], base_url: Optional[str] = None,
     """
     if not raw_html:
         return ""
+    raw_html = _promote_lazy_images(raw_html)
     try:
         # 统一包一层容器再解析，避免多根节点问题
         parser = lxml_html.HTMLParser(encoding="utf-8", recover=True)

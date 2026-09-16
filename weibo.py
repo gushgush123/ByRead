@@ -19,6 +19,8 @@ from urllib.parse import quote
 
 import requests
 
+import db
+
 log = logging.getLogger("byread.weibo")
 
 UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 "
@@ -353,8 +355,11 @@ def fetch_user_weibo(
             if not status_id:
                 continue
             guid = f"weibo:status:{status_id}"
-            # 已有正文的不重复取；已入库但缺正文的继续补（逐次补齐）
-            allow_long = longtext_budget > 0 and not state.get(guid)
+            # 没有正文、或正文是旧版解析逻辑取的 → 值得再取一次长文
+            old = state.get(guid) or {}
+            allow_long = longtext_budget > 0 and (
+                not old.get("len") or old.get("v", 0) < db.CONTENT_VERSION
+            )
             content = _build_content(mblog, cookie, allow_long)
             if allow_long and mblog.get("isLongText") and content:
                 longtext_budget -= 1

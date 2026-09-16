@@ -31,6 +31,12 @@ INSTANCE_DIR = BASE_DIR / "instance"
 DB_PATH = INSTANCE_DIR / "bai_read.db"
 
 # 默认设置：首次启动写入 settings 表
+# 正文提取逻辑的版本号。**改动解析方式（比如新支持了某种图片写法、换了解析器）就 +1**，
+# 已入库的老文章会在下次刷新时自动按新逻辑重取一遍正文。
+# 用版本号而不是"看正文长度/有没有图"来判断，是因为后者既会漏（有正文但内容过时）
+# 又会反复触发（正文本来就没图的内容每次刷新都白跑一次请求）。
+CONTENT_VERSION = 2
+
 DEFAULT_SETTINGS: dict[str, str] = {
     "theme": "light",                       # light / dark
     "view_mode": "card",                    # card / list
@@ -161,6 +167,7 @@ CREATE TABLE IF NOT EXISTS articles (
     published   TEXT NOT NULL,
     fetched_at  TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
     content_tried INTEGER DEFAULT 0,
+    content_v   INTEGER DEFAULT 0,
     FOREIGN KEY (feed_id) REFERENCES feeds(id) ON DELETE CASCADE,
     UNIQUE (feed_id, guid)
 );
@@ -206,6 +213,7 @@ CREATE INDEX IF NOT EXISTS idx_user_actions_folder ON user_actions(folder_id);
 # 老库升级用：列不存在时才补
 MIGRATIONS: list[tuple[str, str, str]] = [
     ("articles", "is_deleted", "is_deleted INTEGER DEFAULT 0"),
+    ("articles", "content_v", "content_v INTEGER DEFAULT 0"),
     ("user_actions", "folder_id", "folder_id INTEGER"),
 ]
 
@@ -448,19 +456,22 @@ def insert_article(feed_id: int, item: dict) -> bool:
     """
     try:
         with get_conn() as conn:
+            content = item.get("content")
             cur = conn.execute(
                 "INSERT OR IGNORE INTO articles"
-                "(feed_id, guid, title, summary, content, link, author, published) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "(feed_id, guid, title, summary, content, link, author, published, content_v) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     feed_id,
                     item.get("guid") or make_guid(feed_id, item.get("link"), item.get("title")),
                     (item.get("title") or "")[:500],
                     item.get("summary"),
-                    item.get("content"),
+                    content,
                     item.get("link"),
                     item.get("author"),
                     to_iso(item.get("published")),
+                    # 入库时正文就是用当前版本的解析逻辑生成的
+                    CONTENT_VERSION if content else 0,
                 ),
             )
             return cur.rowcount > 0
@@ -486,10 +497,12 @@ def update_article_if_incomplete(feed_id: int, item: dict) -> bool:
         new_content = item.get("content") or ""
         new_title = (item.get("title") or "")[:500]
         new_summary = item.get("summary") or ""
+        new_link = (item.get("link") or "").strip()
 
         with get_conn() as conn:
             row = _row(conn.execute(
-                "SELECT content, title, summary FROM articles "
+                "SELECT content, title, summary, link, COALESCE(content_v, 0) AS v "
+                "FROM articles "
                 "WHERE feed_id = ? AND guid = ? AND COALESCE(is_deleted, 0) = 0",
                 (feed_id, guid),
             ))
@@ -499,19 +512,35 @@ def update_article_if_incomplete(feed_id: int, item: dict) -> bool:
             old_content = row["content"] or ""
             old_title = row["title"] or ""
             old_summary = row["summary"] or ""
+            old_link = row["link"] or ""
+            old_v = int(row["v"] or 0)
 
             has_new_img = "<img" in new_content
-            set_content = bool(new_content) and (
+            # 三个条件都必须先满足"值真的变了"，否则会出现每次刷新都重复写入同一份内容
+            # （实测：标题里含 "<" 的文章，因为脏标题判定只看旧值，导致每轮都算一次"补齐"）
+            set_content = bool(new_content) and new_content != old_content and (
                 not old_content
                 or ("<img" not in old_content and has_new_img)
                 or len(new_content) > len(old_content) + 500
             )
-            set_title = bool(new_title) and (
+            set_title = bool(new_title) and new_title != old_title and (
                 not old_title or "<" in old_title or "{" in old_title
             )
-            set_summary = bool(new_summary) and not old_summary.strip()
+            set_summary = (bool(new_summary) and new_summary != old_summary
+                           and not old_summary.strip())
+            # 链接也可能被"改对"：例如知乎想法原本指向想法页，取到被分享的回答后
+            # 应该指向回答页（正文就是从那里来的）
+            set_link = bool(new_link) and new_link != old_link
 
-            if not (set_content or set_title or set_summary):
+            if not (set_content or set_title or set_summary or set_link):
+                # 内容确实没变化。但如果正文是用旧版逻辑取的，要把版本号推进到当前版本 ——
+                # 否则"内容过时"这个判断永远成立，每次刷新都会重复请求同一份内容。
+                # 这里只改一个整数列，代价极小，而且不计入"补齐 N 篇"的提示。
+                if new_content and old_v < CONTENT_VERSION:
+                    conn.execute(
+                        "UPDATE articles SET content_v = ? WHERE feed_id = ? AND guid = ?",
+                        (CONTENT_VERSION, feed_id, guid),
+                    )
                 return False
 
             # 只更新真正要改的列，避免把几十 KB 的正文白白重写一遍
@@ -519,12 +548,17 @@ def update_article_if_incomplete(feed_id: int, item: dict) -> bool:
             if set_content:
                 sets.append("content = ?")
                 params.append(new_content)
+                sets.append("content_v = ?")       # 记下这份正文是用哪个版本的逻辑取的
+                params.append(CONTENT_VERSION)
             if set_title:
                 sets.append("title = ?")
                 params.append(new_title)
             if set_summary:
                 sets.append("summary = ?")
                 params.append(new_summary)
+            if set_link:
+                sets.append("link = ?")
+                params.append(new_link)
             params.extend([feed_id, guid])
 
             conn.execute(
@@ -735,20 +769,28 @@ def get_existing_guids(feed_id: int) -> set[str]:
         return set()
 
 
-def get_content_state(feed_id: int) -> dict[str, bool]:
+def get_content_state(feed_id: int) -> dict[str, dict]:
     """
-    取某个订阅源已有文章的 {guid: 是否已有正文}。
-    本地源用它做两件事：已经有正文的不再重复请求；已入库但缺正文的**继续补**
-    （否则一次刷新的配额用完后，那批文章永远补不上正文）。
+    取某个订阅源已有文章的正文状态：{guid: {"len": 正文长度, "img": 是否含图}}。
+
+    本地源用它决定"这篇还要不要再去请求一次正文"：
+      - 没正文（len=0）→ 要取
+      - 有正文但没图、而这类内容本该有图（例如知乎想法分享了带图回答）→ 还要取
+    光看"有没有正文"是不够的：想法卡片自带文字却没有图，
+    只看布尔值就会永远不去补图（实测就是这个问题）。
     """
     try:
         with get_conn() as conn:
             rows = conn.execute(
-                "SELECT guid, (content IS NOT NULL AND content <> '') AS has_content "
+                "SELECT guid, length(COALESCE(content, '')) AS len, "
+                "  (COALESCE(content, '') LIKE '%<img%') AS img, "
+                "  COALESCE(link, '') AS link, COALESCE(content_v, 0) AS v "
                 "FROM articles WHERE feed_id = ?",
                 (feed_id,),
             ).fetchall()
-        return {r["guid"]: bool(r["has_content"]) for r in rows}
+        return {r["guid"]: {"len": int(r["len"] or 0), "img": bool(r["img"]),
+                            "link": r["link"], "v": int(r["v"] or 0)}
+                for r in rows}
     except Exception as exc:  # noqa: BLE001
         log.error("读取正文状态失败 feed=%s：%s", feed_id, exc)
         return {}
