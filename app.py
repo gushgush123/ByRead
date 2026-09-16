@@ -94,6 +94,12 @@ def _title_is_placeholder(title: Optional[str], feed_url: str) -> bool:
     for prefix in ("B站 · ", "知乎 · ", "微博 · "):
         if title == f"{prefix}{tail}":
             return True
+    # 标题就是订阅地址的域名："搜索即订阅"里"直接添加该订阅地址"那个候选就是这么填的
+    # （它为了秒回不去抓源，标题只能先用域名兜着）。这不是真名，抓取成功后用源里的真名替换。
+    host = (urlparse(feed_url).netloc or "").lower()
+    bare = host[4:] if host.startswith("www.") else host
+    if bare and title.strip().lower() in (host, bare):
+        return True
     return bool(re.match(r"^(B站 · )?(用户|UP)?\s*\d+$", title.strip()))
 
 
@@ -324,6 +330,17 @@ def _current_view() -> str:
     return view if view in VALID_VIEWS else "all"
 
 
+def _counts() -> dict:
+    """
+    给前端的角标数字。**必须带上关键词过滤**，和列表接口保持同一套口径。
+
+    不带过滤的后果实测过：用户配了过滤词「直播」（藏起 3 篇）时，
+    任何一次操作（标记已读 / 收藏 / 删除 / 删订阅）返回的角标都会从 216 跳回 219，
+    和列表里的总数对不上，看起来像"凭空多出来 3 篇"。
+    """
+    return db.get_counts(keywords=db.get_filter_keywords())
+
+
 @app.get("/api/articles")
 def api_articles():
     view = _current_view()
@@ -364,7 +381,7 @@ def api_articles():
 
 @app.get("/api/counts")
 def api_counts():
-    return jsonify(db.get_counts(keywords=db.get_filter_keywords()))
+    return jsonify(_counts())
 
 
 @app.get("/api/article/<int:article_id>")
@@ -390,6 +407,10 @@ def api_article(article_id: int):
             "folder_id": article.get("folder_id"),
             "folder_name": article.get("folder_name"),
             "folder_color": article.get("folder_color"),
+            # 播客音频（阅读页的播放器要用）。地址单独一列，不在 content 里 —— 
+            # 正文清洗会把 <audio> 整段丢掉，那是防注入的红线
+            "audio_url": article.get("audio_url"),
+            "audio_duration": article.get("audio_duration"),
         }
     )
 
@@ -455,13 +476,13 @@ def api_delete_article(article_id: int):
     if not db.get_article(article_id):
         return jsonify({"ok": False, "error": "文章不存在"}), 404
     ok = db.delete_article(article_id)
-    return jsonify({"ok": ok, "counts": db.get_counts()})
+    return jsonify({"ok": ok, "counts": _counts()})
 
 
 @app.post("/api/article/<int:article_id>/restore")
 def api_restore_article(article_id: int):
     ok = db.restore_article(article_id)
-    return jsonify({"ok": ok, "counts": db.get_counts()})
+    return jsonify({"ok": ok, "counts": _counts()})
 
 
 @app.post("/api/article/<int:article_id>/folder")
@@ -538,7 +559,7 @@ def api_batch_articles():
         "action": action,
         "affected": affected,
         "ids": ids,
-        "counts": db.get_counts(),
+        "counts": _counts(),
         "folders": db.get_folders(),
     })
 
@@ -585,7 +606,7 @@ def api_delete_channel(channel_id: int):
     if not db.get_channel(channel_id):
         return jsonify({"ok": False, "error": "频道不存在"}), 404
     ok = db.delete_channel(channel_id)
-    return jsonify({"ok": ok, "channels": db.get_channels(), "counts": db.get_counts()})
+    return jsonify({"ok": ok, "channels": db.get_channels(), "counts": _counts()})
 
 
 @app.get("/api/folders")
@@ -622,13 +643,13 @@ def api_delete_folder(folder_id: int):
     if not db.get_folder(folder_id):
         return jsonify({"ok": False, "error": "收藏夹不存在"}), 404
     ok = db.delete_folder(folder_id)
-    return jsonify({"ok": ok, "folders": db.get_folders(), "counts": db.get_counts()})
+    return jsonify({"ok": ok, "folders": db.get_folders(), "counts": _counts()})
 
 
 @app.post("/api/read/all")
 def api_read_all():
     count = db.mark_all_read()
-    return jsonify({"ok": True, "count": count, "counts": db.get_counts()})
+    return jsonify({"ok": True, "count": count, "counts": _counts()})
 
 
 # --------------------------------------------------------------------------- #
@@ -670,7 +691,7 @@ def api_delete_feed(feed_id: int):
     ok = db.delete_feed(feed_id)
     if not ok:
         return jsonify({"ok": False, "error": "订阅不存在"}), 404
-    return jsonify({"ok": True, "counts": db.get_counts()})
+    return jsonify({"ok": True, "counts": _counts()})
 
 
 @app.post("/api/feed/<int:feed_id>/toggle")
@@ -997,7 +1018,7 @@ def api_opml_import():
 @app.delete("/api/articles/clear")
 def api_clear_articles():
     count = db.clear_articles()
-    return jsonify({"ok": True, "count": count, "counts": db.get_counts()})
+    return jsonify({"ok": True, "count": count, "counts": _counts()})
 
 
 # --------------------------------------------------------------------------- #

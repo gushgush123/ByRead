@@ -168,6 +168,11 @@ CREATE TABLE IF NOT EXISTS articles (
     fetched_at  TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
     content_tried INTEGER DEFAULT 0,
     content_v   INTEGER DEFAULT 0,
+    -- 播客音频（来自条目里的 <enclosure type="audio/...">）。
+    -- 单独一列，**不塞进 content**：正文清洗会把 <audio>/<video>/<source> 整段丢掉，
+    -- 那是防注入的红线，不能为了放播放器就放开。
+    audio_url      TEXT,
+    audio_duration INTEGER,          -- 秒；源里没有 itunes:duration 时为 NULL
     FOREIGN KEY (feed_id) REFERENCES feeds(id) ON DELETE CASCADE,
     UNIQUE (feed_id, guid)
 );
@@ -234,6 +239,8 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("articles", "is_deleted", "is_deleted INTEGER DEFAULT 0"),
     ("articles", "content_v", "content_v INTEGER DEFAULT 0"),
     ("user_actions", "folder_id", "folder_id INTEGER"),
+    ("articles", "audio_url", "audio_url TEXT"),
+    ("articles", "audio_duration", "audio_duration INTEGER"),
 ]
 
 # 收藏夹可选配色（挑的都是深浅色模式下都能看清的）
@@ -493,8 +500,9 @@ def insert_article(feed_id: int, item: dict) -> bool:
             content = item.get("content")
             cur = conn.execute(
                 "INSERT OR IGNORE INTO articles"
-                "(feed_id, guid, title, summary, content, link, author, published, content_v) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "(feed_id, guid, title, summary, content, link, author, published, content_v, "
+                " audio_url, audio_duration) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     feed_id,
                     item.get("guid") or make_guid(feed_id, item.get("link"), item.get("title")),
@@ -506,6 +514,8 @@ def insert_article(feed_id: int, item: dict) -> bool:
                     to_iso(item.get("published")),
                     # 入库时正文就是用当前版本的解析逻辑生成的
                     CONTENT_VERSION if content else 0,
+                    item.get("audio_url"),
+                    item.get("audio_duration"),
                 ),
             )
             return cur.rowcount > 0
@@ -525,6 +535,8 @@ def update_article_if_incomplete(feed_id: int, item: dict) -> bool:
          没有这条的话，抓取逻辑的改进永远追不到已经入库的文章上
          （实测：B站图文补上图片后，老文章依然是没图的旧内容）。
       3. 标题是脏的：带 HTML 标签（搜索结果里的 `<em>` 高亮）或结构化数据的字符串残留。
+      4. 播客音频是后加的字段：早先入库的播客文章没有 audio_url，
+         靠这条在下次刷新时补上，不需要重新订阅或清库。
     """
     try:
         guid = item.get("guid") or make_guid(feed_id, item.get("link"), item.get("title"))
@@ -532,10 +544,12 @@ def update_article_if_incomplete(feed_id: int, item: dict) -> bool:
         new_title = (item.get("title") or "")[:500]
         new_summary = item.get("summary") or ""
         new_link = (item.get("link") or "").strip()
+        new_audio = (item.get("audio_url") or "").strip()
+        new_duration = item.get("audio_duration")
 
         with get_conn() as conn:
             row = _row(conn.execute(
-                "SELECT content, title, summary, link, COALESCE(content_v, 0) AS v "
+                "SELECT content, title, summary, link, audio_url, COALESCE(content_v, 0) AS v "
                 "FROM articles "
                 "WHERE feed_id = ? AND guid = ? AND COALESCE(is_deleted, 0) = 0",
                 (feed_id, guid),
@@ -547,6 +561,7 @@ def update_article_if_incomplete(feed_id: int, item: dict) -> bool:
             old_title = row["title"] or ""
             old_summary = row["summary"] or ""
             old_link = row["link"] or ""
+            old_audio = row["audio_url"] or ""
             old_v = int(row["v"] or 0)
 
             has_new_img = "<img" in new_content
@@ -565,8 +580,11 @@ def update_article_if_incomplete(feed_id: int, item: dict) -> bool:
             # 链接也可能被"改对"：例如知乎想法原本指向想法页，取到被分享的回答后
             # 应该指向回答页（正文就是从那里来的）
             set_link = bool(new_link) and new_link != old_link
+            # 音频一旦抓到就不用再写（同一个 href 不会变）；换地址了就整份覆盖，
+            # 包括把时长一起改掉 —— 否则会出现"新地址配旧时长"
+            set_audio = bool(new_audio) and new_audio != old_audio
 
-            if not (set_content or set_title or set_summary or set_link):
+            if not (set_content or set_title or set_summary or set_link or set_audio):
                 # 内容确实没变化。但如果正文是用旧版逻辑取的，要把版本号推进到当前版本 ——
                 # 否则"内容过时"这个判断永远成立，每次刷新都会重复请求同一份内容。
                 # 这里只改一个整数列，代价极小，而且不计入"补齐 N 篇"的提示。
@@ -593,6 +611,11 @@ def update_article_if_incomplete(feed_id: int, item: dict) -> bool:
             if set_link:
                 sets.append("link = ?")
                 params.append(new_link)
+            if set_audio:
+                sets.append("audio_url = ?")
+                params.append(new_audio)
+                sets.append("audio_duration = ?")
+                params.append(int(new_duration) if new_duration else None)
             params.extend([feed_id, guid])
 
             conn.execute(
@@ -746,6 +769,9 @@ def get_articles(
             "  COALESCE(ua.is_read, 0) AS is_read, COALESCE(ua.is_starred, 0) AS is_starred, "
             "  ua.folder_id AS folder_id, fl.name AS folder_name, fl.color AS folder_color, "
             "  (a.content IS NOT NULL AND a.content <> '') AS has_content, "
+            # 只给"有没有音频"这个布尔值：卡片上只要一个小喇叭标记，
+            # 音频地址本身（可能上百 KB 的签名 URL 也用不上）留给阅读页接口
+            "  (a.audio_url IS NOT NULL AND a.audio_url <> '') AS has_audio, "
             # 只截前一段来找缩略图，避免把整篇正文（可能几十 KB）都读出来
             "  substr(a.content, 1, 8000) AS content_head "
             "FROM articles a "

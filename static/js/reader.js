@@ -15,6 +15,7 @@
   const noteEl = document.getElementById('reader-note');
   const starBtn = document.getElementById('btn-star');
   const folderBtn = document.getElementById('btn-folder');
+  const audioEl = document.getElementById('reader-audio');
 
   let summary = '';
   try {
@@ -30,6 +31,56 @@
 
   function markRead() {
     api('POST', '/api/article/' + articleId + '/read', { is_read: true }).catch(function () {});
+  }
+
+  /** 秒 → "12:34" / "1:02:03"，解析不出来就返回空串 */
+  function formatDuration(seconds) {
+    const s = parseInt(seconds, 10);
+    if (!s || s < 0) return '';
+    const pad = function (n) { return (n < 10 ? '0' : '') + n; };
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    return h ? (h + ':' + pad(m) + ':' + pad(sec)) : (m + ':' + pad(sec));
+  }
+
+  /* 播客音频播放器。音频地址是单独一列，正文里没有 <audio>（被清洗规则整段删掉了），
+     所以这里用 DOM 现造一个 —— 不碰 innerHTML，也不去放开 sanitize_html 的拦截。 */
+  function renderAudio(data) {
+    if (!audioEl) return;
+    const url = (data && data.audio_url) || '';
+    if (!url) return;                       // 非播客源：什么都不渲染
+    if (audioEl.dataset.url === url) return;  // 重试提取正文时不重建播放器（会打断正在播的音频）
+    audioEl.innerHTML = '';
+    audioEl.dataset.url = url;
+
+    const player = document.createElement('audio');
+    player.className = 'reader-audio__player';
+    player.controls = true;
+    player.preload = 'none';                // 一集可能上百 MB，点了播放再请求
+    player.src = url;
+    audioEl.appendChild(player);
+
+    const bar = document.createElement('div');
+    bar.className = 'reader-audio__bar';
+    const label = document.createElement('span');
+    label.className = 'reader-audio__label';
+    label.textContent = '🎧 播客音频';
+    bar.appendChild(label);
+
+    const duration = formatDuration(data.audio_duration);
+    if (duration) {
+      const d = document.createElement('span');
+      d.textContent = '时长 ' + duration;
+      bar.appendChild(d);
+    }
+    const hint = document.createElement('span');
+    hint.className = 'reader-audio__hint';
+    hint.textContent = '播放器上右键可另存音频';
+    bar.appendChild(hint);
+    audioEl.appendChild(bar);
+
+    audioEl.hidden = false;
   }
 
   function renderFallback(reason, link) {
@@ -85,6 +136,8 @@
   async function loadContent(force) {
     try {
       const data = await api('GET', '/api/article/' + articleId);
+      // 音频先渲染：就算正文提取失败（纯播客源很常见），播放器也必须在
+      renderAudio(data);
       if (data.content) {
         renderContent(data.content);
         return;

@@ -37,6 +37,14 @@ UA = (
 TIMEOUT = 10
 LOCAL_SCHEME = "byread://"
 
+# "这个地址是不是订阅源"只需要读开头就能判定：条目都排在文件前部。
+# 实测第一个 <item> 结束的位置——Syntax 12KB / Changelog 11KB / Julia Evans 12KB /
+# 云风 6KB / 少数派 1KB（整份文件却有 9.8MB）。取 256KB 留了 20 倍富余，
+# 万一某源的条目排在很后面，下面的逻辑会整份重试一次再判定。
+# 为什么要这么做：整份下载经常顶到 10 秒超时红线，超时后又退回"自动发现"，
+# 把同一份大文件又下两次，粘贴地址订阅要等半分钟才返回。
+PROBE_MAX_BYTES = 256 * 1024
+
 _requests = requests.Session()
 _requests.headers.update({"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9"})
 
@@ -325,15 +333,123 @@ def local_feed_url(platform: str, kind: str, param) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# 播客音频（enclosure）
+#
+# 音频地址**单独存一列**，绝不塞进正文：清洗白名单里 audio/video/source 属于
+# DROP_ENTIRELY（整段删除），那是防注入的红线，不能为了渲染播放器就放开。
+# 阅读页拿 articles.audio_url 自己造 <audio> 元素，不经过富文本。
+# --------------------------------------------------------------------------- #
+AUDIO_EXTENSIONS = (
+    ".mp3", ".m4a", ".m4b", ".mp4a", ".aac", ".ogg", ".oga", ".opus", ".wav", ".flac",
+)
+# 超过这个时长的一律当解析错误丢掉（播客再长也到不了 24 小时）
+_MAX_AUDIO_SECONDS = 24 * 3600
+
+
+def parse_duration(value) -> Optional[int]:
+    """
+    itunes:duration → 秒。源里的写法很杂：3637（int 或 str）、"1:02:03"、"02:03"。
+    认不出来就返回 None（宁可不显示时长，也不显示一个错的）。
+    """
+    try:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            seconds = int(value)
+        else:
+            text = str(value).strip()
+            if not text:
+                return None
+            if text.isdigit():
+                seconds = int(text)
+            else:
+                parts = text.split(":")
+                if len(parts) not in (2, 3):
+                    return None
+                seconds = 0
+                for part in parts:          # "1:02:03" 从高位往低位累加
+                    seconds = seconds * 60 + int(part)
+        return seconds if 0 < seconds <= _MAX_AUDIO_SECONDS else None
+    except (TypeError, ValueError):
+        log.debug("时长解析失败：%r", value)
+        return None
+
+
+def _enclosure_candidates(entry) -> list[dict]:
+    """
+    汇总所有可能是附件的地方。
+
+    feedparser 把 <enclosure> 同时放进了 entry.enclosures 和 entry.links（rel=enclosure），
+    而 entry.enclosures 是派生出来的键 —— 用 .get() 取得到，但不在 entry.keys() 里
+    （实测：用 keys() 判断会以为这个源没有音频，其实有）。两边都读一遍再按地址去重，
+    顺便兼容 Podcasting 2.0 里常见的 media:content。
+    """
+    found: list[dict] = []
+    for source in (entry.get("enclosures"), entry.get("links"), entry.get("media_content")):
+        for item in source or []:
+            if isinstance(item, dict):
+                found.append(item)
+    return found
+
+
+def pick_audio(entry) -> tuple[Optional[str], Optional[int]]:
+    """
+    取第一个音频附件，返回 (地址, 时长秒数)；没有音频返回 (None, None)。
+
+    只认 audio/*：视频播客（Syntax、很多访谈类）会把 video/mp4 放在 audio 前面，
+    不判断类型的话阅读页会挂上一个放不出声的播放器。完全没写 type 的按扩展名兜底。
+    """
+    seen: set[str] = set()
+    for enc in _enclosure_candidates(entry):
+        href = str(enc.get("href") or enc.get("url") or "").strip()
+        if not href or href in seen:
+            continue
+        seen.add(href)
+        if not href.lower().startswith(("http://", "https://")):
+            continue
+        enc_type = str(enc.get("type") or "").strip().lower()
+        if enc_type.startswith("audio/"):
+            return href, parse_duration(entry.get("itunes_duration"))
+        if not enc_type and href.split("?")[0].lower().endswith(AUDIO_EXTENSIONS):
+            # 大多数播客源都写了 type；这里只是不让"漏写 type"的源丢掉音频
+            return href, parse_duration(entry.get("itunes_duration"))
+    return None, None
+
+
+# --------------------------------------------------------------------------- #
 # 抓取
 # --------------------------------------------------------------------------- #
+def _read_capped(resp, max_bytes: int) -> tuple[bytes, bool]:
+    """只读响应开头的 max_bytes 字节。返回 (内容, 是否被截断)。"""
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        for chunk in resp.iter_content(64 * 1024):
+            if not chunk:
+                continue
+            chunks.append(chunk)
+            total += len(chunk)
+            if total >= max_bytes:
+                return b"".join(chunks)[:max_bytes], True
+    except Exception as exc:  # noqa: BLE001
+        # 读到一半断了：不知道后面还有没有，一律当截断处理（由上层决定要不要整份重来）
+        log.info("读取响应中断，按截断处理：%s", exc)
+        return b"".join(chunks), True
+    return b"".join(chunks), False
+
+
 def fetch_feed(feed_url: str, timeout: int = TIMEOUT, limit: int = 20,
-               content_state: Optional[dict] = None) -> dict:
+               content_state: Optional[dict] = None,
+               max_bytes: Optional[int] = None) -> dict:
     """
     统一抓取入口。返回：
-    {title, site_url, description, icon, entries: [{guid,title,summary,content,link,author,published}]}
+    {title, site_url, description, icon,
+     entries: [{guid,title,summary,content,link,author,published,audio_url,audio_duration}]}
     抓取或解析失败会抛异常，由上层负责重试与错误计数。
     content_state：库里 {guid: 是否已有正文}，本地源用它跳过/补齐正文请求。
+    max_bytes：只读开头这么多字节再解析（只用于"这是不是个源"的探测，正式抓取必须传 None）。
     """
     if is_local_feed(feed_url):
         result = fetch_local_feed(feed_url, limit=limit, content_state=content_state)
@@ -341,17 +457,37 @@ def fetch_feed(feed_url: str, timeout: int = TIMEOUT, limit: int = 20,
             log.info("本地源暂无内容：%s", feed_url)
         return result
 
-    resp = _requests.get(feed_url, timeout=timeout, allow_redirects=True)
-    if resp.status_code >= 400:
-        raise RuntimeError(f"HTTP {resp.status_code}")
-    if not resp.content:
+    truncated = False
+    resp = _requests.get(feed_url, timeout=timeout, allow_redirects=True,
+                         stream=bool(max_bytes))
+    try:
+        if resp.status_code >= 400:
+            raise RuntimeError(f"HTTP {resp.status_code}")
+        if max_bytes:
+            raw, truncated = _read_capped(resp, max_bytes)
+        else:
+            raw = resp.content
+    finally:
+        resp.close()
+    if not raw:
         raise RuntimeError("返回内容为空")
 
-    parsed = feedparser.parse(resp.content)
+    parsed = feedparser.parse(raw)
     entries = parsed.get("entries") or []
     if not entries and parsed.get("bozo"):
-        # 不是有效的 feed
-        raise RuntimeError("无法解析为订阅源内容")
+        if truncated:
+            # 只读了开头、一条条目都没解出来：也可能是条目排在文件很后面（少见）。
+            # 宁可慢一次，也不能把本来可用的源判成不可用
+            log.info("截断探测没解析出条目，整份重试：%s", feed_url)
+            full = _requests.get(feed_url, timeout=timeout, allow_redirects=True)
+            if full.status_code >= 400:
+                raise RuntimeError(f"HTTP {full.status_code}")
+            raw = full.content
+            parsed = feedparser.parse(raw)
+            entries = parsed.get("entries") or []
+        if not entries and parsed.get("bozo"):
+            # 不是有效的 feed
+            raise RuntimeError("无法解析为订阅源内容")
 
     feed_meta = parsed.get("feed") or {}
     title = (feed_meta.get("title") or "").strip() or urlparse(feed_url).netloc
@@ -430,6 +566,9 @@ def _entry_to_item(entry, feed_url: str) -> Optional[dict]:
     if not title and not link:
         return None
 
+    # 播客：音频地址单独给一个字段（正文里不会有 <audio>，那类标签在清洗时被整段删掉）
+    audio_url, audio_duration = pick_audio(entry)
+
     return {
         "guid": str(guid)[:500],
         "title": title or "(无标题)",
@@ -438,6 +577,8 @@ def _entry_to_item(entry, feed_url: str) -> Optional[dict]:
         "link": link,
         "author": author,
         "published": published,
+        "audio_url": audio_url,
+        "audio_duration": audio_duration,
     }
 
 
@@ -518,9 +659,12 @@ def probe_feed_url(url: str) -> dict:
     """
     校验一个地址是否可用作订阅源。返回 {ok, title, site_url, icon, entry_count, error}
     （供"粘贴链接直接添加"用，避免添加一个抓不到的源）
+
+    只读开头一小段（PROBE_MAX_BYTES = 256KB）来判定，避免大源（播客源整份接近 10MB）
+    把订阅接口拖成几十秒。
     """
     try:
-        data = fetch_feed(url, limit=1)
+        data = fetch_feed(url, limit=1, max_bytes=PROBE_MAX_BYTES)
         return {
             "ok": True,
             "title": data.get("title") or url,

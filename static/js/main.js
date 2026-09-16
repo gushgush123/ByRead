@@ -359,6 +359,16 @@
     return div;
   }
 
+  /* 播客标记：列表接口只回 has_audio 这个布尔值（音频地址在阅读页才取）。
+     网格模式浮在缩略图左下角，宽卡片模式跟在元信息里。 */
+  function audioBadge() {
+    const badge = document.createElement('span');
+    badge.className = 'card__audio';
+    badge.textContent = '🎧';
+    badge.title = '这一期带音频，点开就能播放';
+    return badge;
+  }
+
   function actionButton(label, title, className, onClick) {
     const btn = document.createElement('button');
     btn.className = className;
@@ -405,6 +415,11 @@
       box.appendChild(dot);
       box.appendChild(name);
       right.appendChild(box);
+    }
+
+    // 播客标记：网格模式已经有缩略图角标，只有宽卡片模式传 withAudio
+    if (options.withAudio && article.has_audio) {
+      right.appendChild(audioBadge());
     }
 
     // 原文链接：挂在每张卡片上、始终可见，鼠标悬停能看到完整地址（便于核对来源）
@@ -518,6 +533,8 @@
     } else {
       placeholder();
     }
+    // 播客的缩略图左下角挂个耳机，一眼能看出这条点开有音频
+    if (article.has_audio) thumb.appendChild(audioBadge());
     card.appendChild(thumb);
 
     const actions = document.createElement('div');
@@ -562,7 +579,7 @@
     }
 
     card.appendChild(titleElement(article.title, state.q));
-    card.appendChild(metaElement(article, { withLink: true }));
+    card.appendChild(metaElement(article, { withLink: true, withAudio: true }));
 
     const actions = document.createElement('div');
     actions.className = 'card__actions';

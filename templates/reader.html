@@ -39,6 +39,11 @@
     <span data-time="{{ article.published }}">{{ article.published }}</span>
   </div>
 
+  {# 播客音频：地址来自 articles.audio_url（单独一列）。
+     正文里不会有 <audio> —— 清洗白名单把 audio/video/source 整段删掉，
+     那是防注入的红线；播放器由 reader.js 用 DOM 现造，不经过富文本。 #}
+  <div class="reader-audio" id="reader-audio" hidden></div>
+
   <article class="reader-body" id="reader-body">
     {% if article.content %}
       {# 服务端已清洗过一次；这里仍然经过前端 DOMPurify 二次清洗 #}
