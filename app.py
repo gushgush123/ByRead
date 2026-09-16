@@ -703,7 +703,12 @@ def api_search():
 
 
 def _add_feed_from_url(url: str) -> tuple[Optional[dict], Optional[str]]:
-    """粘贴链接添加：先尝试识别平台主页，再当作订阅地址校验。"""
+    """
+    粘贴链接添加。优先级：
+      1. 平台主页识别（B站空间 / 知乎 / 微博 / 少数派…）
+      2. 这个地址本身就是订阅地址 → 直接校验
+      3. 普通网页 → 自动发现里面的订阅地址（每个候选都必须真实解析成功）
+    """
     url = (url or "").strip()
     if not url.lower().startswith(("http://", "https://")):
         return None, "只能添加 http 或 https 开头的地址"
@@ -718,19 +723,36 @@ def _add_feed_from_url(url: str) -> tuple[Optional[dict], Optional[str]]:
         return info, None
 
     probe = feed_parser.probe_feed_url(url)
-    if not probe["ok"]:
-        return None, "这个地址抓不到内容，确认一下是不是订阅地址（通常在网站底部或 /feed）"
-    return (
-        {
-            "feed_url": url,
-            "title": probe.get("title") or url,
-            "site_url": probe.get("site_url"),
-            "icon": probe.get("icon"),
-            "description": probe.get("description"),
-            "platform": None,
-        },
-        None,
-    )
+    if probe["ok"] and probe.get("entry_count"):
+        return (
+            {
+                "feed_url": url,
+                "title": probe.get("title") or url,
+                "site_url": probe.get("site_url"),
+                "icon": probe.get("icon"),
+                "description": probe.get("description"),
+                "platform": None,
+            },
+            None,
+        )
+
+    # 走到这里说明它是个普通网页（或抓不到内容）—— 试着从页面里找订阅地址
+    found = feed_parser.discover_feeds(url)
+    if found:
+        best = found[0]
+        log.info("从 %s 自动发现订阅地址：%s", url, best["feed_url"])
+        return (
+            {
+                "feed_url": best["feed_url"],
+                "title": best.get("title") or url,
+                "site_url": best.get("site_url") or url,
+                "icon": best.get("icon"),
+                "description": best.get("description"),
+                "platform": None,
+            },
+            None,
+        )
+    return None, "这个网页里没找到订阅地址。看看页面底部有没有 RSS / 订阅 链接"
 
 
 @app.post("/api/feed")

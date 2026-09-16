@@ -532,3 +532,157 @@ def probe_feed_url(url: str) -> dict:
         }
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "title": None, "error": str(exc)}
+
+
+# --------------------------------------------------------------------------- #
+# 从普通网页里"自动发现"订阅地址
+# --------------------------------------------------------------------------- #
+# <link rel="alternate"> 里算订阅源的 type
+_FEED_LINK_TYPES = ("application/rss+xml", "application/atom+xml", "application/xml",
+                    "text/xml", "application/rdf+xml", "application/feed+json")
+# 找不到 link 标签时，依次试这些常见路径
+COMMON_FEED_PATHS = ("/feed", "/rss", "/atom.xml", "/feed.xml", "/index.xml", "/rss.xml")
+_FEEDISH_PATH_RE = re.compile(r"(^|/)(feed|rss|atom)(\.(xml|rss|json))?$", re.IGNORECASE)
+
+
+def _looks_like_feed_path(path: str) -> bool:
+    p = (path or "").rstrip("/").lower()
+    if not p or p.endswith(".html"):
+        return False
+    return bool(_FEEDISH_PATH_RE.search(p)) or p.endswith((".xml", ".rss"))
+
+
+def extract_feed_links(page_url: str, page_html: str) -> list[str]:
+    """
+    从网页 HTML 里挖出候选订阅地址，按可信度排序：
+      1. <link rel="alternate" type="application/rss+xml|atom+xml|...">（最标准）
+      2. 页面里指向 feed/rss/atom 的 <a>（有些站点只在页脚放个链接）
+    相对地址一律用 urljoin 补全。
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(href: str) -> None:
+        if not href:
+            return
+        try:
+            absolute = urljoin(page_url, href.strip())
+        except Exception:  # noqa: BLE001
+            return
+        if not absolute.lower().startswith(("http://", "https://")):
+            return
+        if absolute in seen:
+            return
+        seen.add(absolute)
+        out.append(absolute)
+
+    try:
+        doc = lxml_html.fromstring(page_html)
+    except Exception as exc:  # noqa: BLE001
+        log.info("解析页面找订阅地址失败：%s", exc)
+        return []
+
+    for el in doc.xpath("//link[@href]"):
+        rel = (el.get("rel") or "").lower()
+        typ = (el.get("type") or "").lower()
+        href = el.get("href") or ""
+        if "feed" in rel:
+            add(href)
+            continue
+        if "alternate" not in rel:
+            continue
+        if any(t in typ for t in _FEED_LINK_TYPES) or _looks_like_feed_path(urlparse(href).path):
+            add(href)
+
+    for el in doc.xpath("//a[@href]"):
+        href = el.get("href") or ""
+        if any(t in href.lower() for t in ("feed", "rss", "atom")) and \
+                _looks_like_feed_path(urlparse(href).path):
+            add(href)
+
+    return out
+
+
+def candidate_feed_urls(page_url: str) -> list[str]:
+    """
+    在**不发请求**的前提下，列出这个页面所有可能的订阅地址：
+    link 标签 / 页面内链接 + 常见路径。
+    常见路径会同时拼在"域名根"和"页面所在目录"下面 ——
+    例如 https://www.ruanyifeng.com/blog/ 的源其实在 /blog/atom.xml，只试根目录会漏掉。
+    """
+    parsed = urlparse(page_url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    directory = page_url if page_url.endswith("/") else page_url.rsplit("/", 1)[0] + "/"
+
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    def add(u: str) -> None:
+        if u not in seen:
+            seen.add(u)
+            urls.append(u)
+
+    for base in (origin, directory):
+        for path in COMMON_FEED_PATHS:
+            add(base.rstrip("/") + path)
+    return urls
+
+
+def discover_feeds(page_url: str, timeout: int = TIMEOUT, need: int = 3,
+                   max_checks: int = 10) -> list[dict]:
+    """
+    从一个普通网页里自动找出可用的订阅地址。
+
+    流程（按需求文档）：
+      1. GET 该页（带浏览器 UA，timeout ≤10s）
+      2. 先看 <link rel="alternate">，再试常见路径（/feed /rss /atom.xml ...）
+      3. **每个候选都必须真实解析成功**才算数（复用 probe_feed_url）——
+         绝不允许把首页 HTML 当成 feed 存进库
+    最多检查 max_checks 个候选，凑够 need 个能用的就提前返回。
+    """
+    if not page_url or not page_url.lower().startswith(("http://", "https://")):
+        return []
+
+    candidates: list[str] = []
+    try:
+        resp = _requests.get(page_url, timeout=timeout, allow_redirects=True,
+                             headers={"User-Agent": UA,
+                                      "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"})
+        final_url = resp.url
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        if resp.status_code < 400 and "html" in ctype:
+            if not resp.encoding or resp.encoding.lower() in ("iso-8859-1", "ascii"):
+                resp.encoding = resp.apparent_encoding or "utf-8"
+            candidates = extract_feed_links(final_url, resp.text)
+            page_url = final_url
+        elif resp.status_code < 400:
+            # 这个地址本身可能就是一个 feed
+            candidates = [final_url]
+    except Exception as exc:  # noqa: BLE001
+        log.info("打开页面失败（继续试常见路径）：%s %s", page_url, exc)
+
+    for url in candidate_feed_urls(page_url):
+        if url not in candidates:
+            candidates.append(url)
+
+    results: list[dict] = []
+    for url in candidates[:max_checks]:
+        probe = probe_feed_url(url)
+        if not probe.get("ok"):
+            continue
+        if not probe.get("entry_count"):
+            # 能解析但一条都读不出来：当作不可用，避免订到一个空壳
+            continue
+        results.append({
+            "feed_url": url,
+            "title": probe.get("title") or urlparse(url).netloc,
+            "site_url": probe.get("site_url") or page_url,
+            "icon": probe.get("icon"),
+            "description": probe.get("description"),
+            "entry_count": probe.get("entry_count"),
+        })
+        if len(results) >= need:
+            break
+    log.info("自动发现：检查 %s 个候选，可用 %s 个（%s）",
+             min(len(candidates), max_checks), len(results), page_url)
+    return results

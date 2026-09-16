@@ -625,10 +625,43 @@ def _preset_matches(platform: Optional[str], keyword: str) -> list[dict]:
     return out
 
 
+def discover_candidates(page_url: str) -> list[dict]:
+    """
+    从一个普通网页里自动发现订阅地址，转成候选格式交给现有弹窗。
+    只有**真实解析成功**的地址才会被返回（绝不允许把首页 HTML 当成 feed）。
+    """
+    try:
+        import feed_parser
+
+        found = feed_parser.discover_feeds(page_url)
+    except Exception as exc:  # noqa: BLE001
+        log.info("自动发现订阅地址失败：%s %s", page_url, exc)
+        return []
+
+    netloc = urlparse(page_url).netloc
+    out = []
+    for item in found:
+        out.append({
+            "label": item.get("title") or netloc,
+            "detail": "在这个网页里发现的订阅地址",
+            "feed_url": item["feed_url"],
+            "title": item.get("title") or netloc,
+            "site_url": item.get("site_url") or page_url,
+            "icon": item.get("icon"),
+            "platform": None,
+        })
+    return out
+
+
 def search(query: str) -> dict:
     """
     搜索即订阅的统一入口。返回：
     {"candidates": [...], "hint": str|None, "notes": [str]}
+
+    链接的优先级（从高到低）：
+      1. 预置源 / 平台识别（少数派、B站空间、知乎主页…）
+      2. 这本身就是一个订阅地址 → 直接校验添加
+      3. 自动发现：打开这个网页，从里面找出订阅地址（每个都必须真实解析成功）
     """
     query = (query or "").strip()
     if not query:
@@ -655,9 +688,14 @@ def search(query: str) -> dict:
                 "hint": None,
                 "notes": [],
             }
+        # L3：普通网页 → 自动发现订阅地址
+        discovered = discover_candidates(query)
+        if discovered:
+            return {"candidates": discovered, "hint": None, "notes": []}
         return {
             "candidates": [],
-            "hint": "这个链接我没法直接订阅，可以试试该网站的订阅地址（通常以 .xml 或 /feed 结尾）",
+            "hint": "这个网页里没找到订阅地址。可以看看页面底部有没有 RSS / 订阅 链接，"
+                    "通常以 .xml 或 /feed 结尾",
             "notes": [],
         }
 
