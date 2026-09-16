@@ -346,10 +346,14 @@ def get_feeds(active_only: bool = False) -> list[dict]:
     try:
         sql = (
             "SELECT f.*, "
-            "  (SELECT COUNT(*) FROM articles a WHERE a.feed_id = f.id) AS article_count, "
+            # 计数必须排除"软删除"的文章，否则设置页和来源筛选条上的篇数会比实际多
+            # （实测：某源显示 16 篇，实际只有 13 篇，差的 3 篇是用户删掉的）
+            "  (SELECT COUNT(*) FROM articles a "
+            "     WHERE a.feed_id = f.id AND COALESCE(a.is_deleted, 0) = 0) AS article_count, "
             "  (SELECT COUNT(*) FROM articles a "
             "     LEFT JOIN user_actions ua ON ua.article_id = a.id "
-            "     WHERE a.feed_id = f.id AND COALESCE(ua.is_read, 0) = 0) AS unread_count "
+            "     WHERE a.feed_id = f.id AND COALESCE(a.is_deleted, 0) = 0 "
+            "       AND COALESCE(ua.is_read, 0) = 0) AS unread_count "
             "FROM feeds f"
         )
         if active_only:
@@ -592,7 +596,7 @@ def _build_filters(
     """
     构造 WHERE 子句。
     keywords 命中标题的文章会被隐藏（在 SQL 层过滤，保证分页计数正确）。
-    query   是用户主动搜索的词，跨 标题/摘要/正文 匹配。
+    query   是用户主动搜索的词，跨 **来源名 / 标题 / 摘要 / 正文** 匹配。
     folder  取 "none"（未分类）或收藏夹 id。
     """
     where: list[str] = ["COALESCE(a.is_deleted, 0) = 0"]   # 软删除的文章永远不出现在任何列表里
@@ -624,11 +628,13 @@ def _build_filters(
 
     if query:
         like = f"%{query.strip()}%"
+        # 除了文章自身的内容，**也匹配订阅源的名字** —— 这样输入"友琳"就能列出
+        # 友琳这个源的全部文章（否则文章正文里没有这几个字，就一条都搜不到）
         where.append(
             "(COALESCE(a.title, '') LIKE ? OR COALESCE(a.summary, '') LIKE ? "
-            " OR COALESCE(a.content, '') LIKE ?)"
+            " OR COALESCE(a.content, '') LIKE ? OR COALESCE(f.title, '') LIKE ?)"
         )
-        params.extend([like, like, like])
+        params.extend([like, like, like, like])
 
     return (" WHERE " + " AND ".join(where)) if where else "", params
 
@@ -699,9 +705,11 @@ def get_articles(
 
         order = "a.published DESC, a.id DESC"
         if query:
-            # 标题命中的排前面
-            order = ("CASE WHEN COALESCE(a.title, '') LIKE ? THEN 0 ELSE 1 END, " + order)
-            params_for_order = [f"%{query.strip()}%"]
+            # 相关度排序：文章标题命中 → 来源名命中 → 其余（摘要/正文命中）。
+            # "来源名命中"整组排在一起，所以搜某个源的名字时，那个源的文章会按时间连着列出来。
+            order = ("CASE WHEN COALESCE(a.title, '') LIKE ? THEN 0 "
+                     "WHEN COALESCE(f.title, '') LIKE ? THEN 1 ELSE 2 END, " + order)
+            params_for_order = [f"%{query.strip()}%", f"%{query.strip()}%"]
 
         limit = max(1, min(int(limit or 30), 100))
         sql = (
@@ -745,8 +753,11 @@ def count_articles(view: str = "all", feed_id: Optional[int] = None,
                    folder: Optional[str] = None) -> int:
     try:
         where, params = _build_filters(view, feed_id, keywords, query, folder)
+        # 必须和 get_articles 用同样的 JOIN：搜索条件里可能引用 feeds 表（按来源名搜索），
+        # 少了这个 JOIN 会直接 SQL 报错，而异常被吞掉后表现为"计数 0、列表却有内容"
         sql = (
             "SELECT COUNT(*) AS n FROM articles a "
+            "JOIN feeds f ON f.id = a.feed_id "
             "LEFT JOIN user_actions ua ON ua.article_id = a.id" + where
         )
         with get_conn() as conn:

@@ -336,6 +336,14 @@ def api_articles():
 
     data = db.get_articles(view=view, feed_id=feed_id, keywords=keywords,
                            limit=limit, cursor=cursor, query=query, folder=folder)
+    total = db.count_articles(view=view, feed_id=feed_id, keywords=keywords,
+                              query=query, folder=folder)
+    # 有多少篇是被"关键词过滤"藏起来的 —— 前端拿它做个提示，
+    # 免得用户看到"来源写着 16 篇、点进去只有 13 篇"时一头雾水
+    hidden = 0
+    if keywords:
+        hidden = max(0, db.count_articles(view=view, feed_id=feed_id, keywords=None,
+                                         query=query, folder=folder) - total)
     return jsonify(
         {
             **data,
@@ -343,8 +351,8 @@ def api_articles():
             "query": query,
             "folder": folder,
             "counts": db.get_counts(keywords=keywords),
-            "total": db.count_articles(view=view, feed_id=feed_id, keywords=keywords,
-                                       query=query, folder=folder),
+            "total": total,
+            "hidden_by_filter": hidden,
             "filter_keywords": keywords,
         }
     )

@@ -915,7 +915,8 @@ body:has(.list.is-grid) { --content-max: 1080px; }
 .search-box__clear:hover { background: var(--bg-hover); color: var(--text); }
 
 /* ---------- 收藏夹条 ---------- */
-.folder-bar {
+.folder-bar,
+.filter-bar {
   display: none;
   align-items: center;
   gap: 6px;
@@ -926,7 +927,20 @@ body:has(.list.is-grid) { --content-max: 1080px; }
   border-bottom: 1px solid var(--border);
   background: var(--bg);
 }
-.folder-bar.is-on { display: flex; }
+.folder-bar.is-on,
+.filter-bar.is-on { display: flex; }
+.filter-bar__label { font-size: 12.5px; color: var(--text-muted); margin-right: 2px; }
+/* 「只看某个来源」上那个清除按钮 */
+.chip__x {
+  border: none;
+  background: transparent;
+  color: inherit;
+  font-size: 11px;
+  line-height: 1;
+  padding: 0 0 0 2px;
+  opacity: 0.65;
+}
+.chip__x:hover { opacity: 1; }
 .chip--folder { font-size: 13px; padding: 5px 11px; }
 .chip--folder.is-active {
   border-color: currentColor;

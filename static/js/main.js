@@ -11,6 +11,7 @@
   const listEl = document.getElementById('list');
   const footerEl = document.getElementById('list-footer');
   const selbarEl = document.getElementById('selbar');
+  const filterBarEl = document.getElementById('filter-bar');
   const viewTitleEl = document.getElementById('view-title');
   const progressEl = document.getElementById('progress');
   const progressText = document.getElementById('progress-text');
@@ -26,6 +27,9 @@
     view: 'all',
     folder: 'all',          // all / none / 收藏夹 id
     q: '',
+    feedId: null,           // 只看某个订阅源（null = 不限）
+    feeds: [],              // 订阅源列表，用于按名字匹配（搜索"友琳"时给出"只看这个源"）
+    hiddenByFilter: 0,      // 被"关键词过滤"隐藏的篇数（页脚给个交代）
     cursor: null,
     hasMore: false,
     articles: [],
@@ -125,15 +129,92 @@
     }
   }
 
+  function scopedFeed() {
+    if (!state.feedId) return null;
+    return state.feeds.filter(function (f) { return f.id === state.feedId; })[0] || null;
+  }
+
   function updateViewTitle() {
-    if (state.view === 'all') viewTitleEl.textContent = '全部';
-    else if (state.view === 'unread') viewTitleEl.textContent = '未读';
-    else if (state.folder === 'all') viewTitleEl.textContent = '星标';
-    else if (state.folder === 'none') viewTitleEl.textContent = '星标 · 未分类';
+    let name;
+    if (state.view === 'all') name = '全部';
+    else if (state.view === 'unread') name = '未读';
+    else if (state.folder === 'all') name = '星标';
+    else if (state.folder === 'none') name = '星标 · 未分类';
     else {
       const f = ByRead.folderById(Number(state.folder));
-      viewTitleEl.textContent = '星标 · ' + (f ? f.name : '收藏夹');
+      name = '星标 · ' + (f ? f.name : '收藏夹');
     }
+    const scoped = scopedFeed();
+    viewTitleEl.textContent = scoped ? (name + ' · ' + scoped.title) : name;
+  }
+
+  /* ---------------- 来源筛选条 ---------------- */
+  /** 按名字模糊匹配订阅源（"友琳" 能匹配到 "友琳_Yurin"） */
+  function matchFeeds(query) {
+    const needle = (query || '').trim().toLowerCase();
+    if (needle.length < 2) return [];
+    return state.feeds.filter(function (f) {
+      const title = (f.title || '').toLowerCase();
+      return title.includes(needle) || (needle.length >= 3 && needle.includes(title));
+    });
+  }
+
+  function renderFilterBar() {
+    const scoped = scopedFeed();
+    const matched = state.q ? matchFeeds(state.q) : [];
+    // 已经限定到某个源时就不再列候选了；否则没匹配到源就把整条收起来
+    if (!scoped && !matched.length) {
+      filterBarEl.classList.remove('is-on');
+      filterBarEl.innerHTML = '';
+      return;
+    }
+    filterBarEl.classList.add('is-on');
+    filterBarEl.innerHTML = '';
+
+    if (scoped) {
+      const chip = document.createElement('button');
+      chip.className = 'chip chip--folder is-active';
+      chip.appendChild(document.createTextNode(
+        '只看来源：' + scoped.title + ' · ' + scoped.article_count + ' 篇'));
+      const x = document.createElement('span');
+      x.className = 'chip__x';
+      x.textContent = '✕';
+      chip.appendChild(x);
+      chip.title = '取消来源筛选';
+      chip.addEventListener('click', function () { setFeedScope(null); });
+      filterBarEl.appendChild(chip);
+      return;
+    }
+
+    const label = document.createElement('span');
+    label.className = 'filter-bar__label';
+    label.textContent = '匹配到订阅源：';
+    filterBarEl.appendChild(label);
+    matched.slice(0, 6).forEach(function (f) {
+      const chip = document.createElement('button');
+      chip.className = 'chip chip--folder';
+      chip.textContent = f.title + ' · ' + f.article_count + ' 篇';
+      chip.title = '只看「' + f.title + '」的全部文章';
+      chip.addEventListener('click', function () { setFeedScope(f.id); });
+      filterBarEl.appendChild(chip);
+    });
+  }
+
+  function setFeedScope(feedId) {
+    state.feedId = feedId;
+    updateViewTitle();
+    renderFilterBar();
+    load(true);
+    closeSidebarIfNarrow();
+  }
+
+  async function loadFeeds() {
+    try {
+      const data = await api('GET', '/api/feeds');
+      state.feeds = data.feeds || [];
+      renderFilterBar();
+      updateViewTitle();
+    } catch (err) { /* 源列表拿不到不影响阅读 */ }
   }
 
   function selectView(view, folder) {
@@ -142,6 +223,7 @@
     setSelectMode(false);
     updateViewTitle();
     renderNav();
+    renderFilterBar();
     load(true);
     closeSidebarIfNarrow();
   }
@@ -445,6 +527,11 @@
       emoji.textContent = '🔍';
       titleEl.textContent = '没有匹配「' + state.q + '」的文章';
       hint.textContent = '试试别的词，或者点搜索框右侧的 ✕ 清除搜索。';
+    } else if (state.feedId) {
+      emoji.textContent = '📡';
+      const scoped = scopedFeed();
+      titleEl.textContent = '「' + (scoped ? scoped.title : '该来源') + '」里没有符合条件的文章';
+      hint.textContent = '点筛选条上的 ✕ 可以取消「只看这个来源」。';
     } else if (state.view === 'starred' && state.folder === 'none') {
       emoji.textContent = '📂';
       titleEl.textContent = '未分类的收藏是空的';
@@ -480,9 +567,22 @@
   function renderFooter() {
     footerEl.innerHTML = '';
     const text = document.createElement('div');
-    text.textContent = state.q
-      ? ('找到 ' + totalOfView() + ' 篇')
-      : ('已加载 ' + state.articles.length + ' 篇 · 共 ' + totalOfView() + ' 篇');
+    const scope = scopedFeed();
+    const hidden = state.hiddenByFilter || 0;
+    const tail = hidden > 0
+      ? '（另有 ' + hidden + ' 篇被关键词过滤隐藏）'
+      : '';
+    if (state.q || scope) {
+      const bits = [];
+      if (state.q) bits.push('搜索「' + state.q + '」');
+      if (scope) bits.push('来源：' + scope.title);
+      text.textContent = bits.join(' · ') + ' → 共 ' + totalOfView() + ' 篇' + tail;
+    } else if (hidden > 0) {
+      text.textContent = '已加载 ' + state.articles.length + ' 篇 · 共 '
+        + totalOfView() + ' 篇' + tail;
+    } else {
+      text.textContent = '已加载 ' + state.articles.length + ' 篇 · 共 ' + totalOfView() + ' 篇';
+    }
     footerEl.appendChild(text);
     if (state.hasMore) {
       const btn = document.createElement('button');
@@ -628,6 +728,7 @@
       let url = '/api/articles?view=' + encodeURIComponent(state.view)
         + '&limit=' + state.pageSize;
       if (state.q) url += '&q=' + encodeURIComponent(state.q);
+      if (state.feedId) url += '&feed_id=' + state.feedId;
       if (state.view === 'starred' && state.folder !== 'all') {
         url += '&folder=' + encodeURIComponent(state.folder);
       }
@@ -637,6 +738,7 @@
       state.cursor = data.next_cursor;
       state.hasMore = !!data.has_more;
       state.counts = data.counts || state.counts;
+      state.hiddenByFilter = data.hidden_by_filter || 0;
       renderNav();
       renderList();
     } catch (err) {
@@ -769,6 +871,7 @@
         summarize(status);
         load(true);
         refreshFolders();
+        loadFeeds();     // 抓完可能有新源/新篇数，刷新一下来源筛选条的计数
       } else {
         hideProgress();
       }
@@ -859,6 +962,7 @@
     if (q === state.q) return;
     state.q = q;
     searchClear.hidden = !q;
+    renderFilterBar();   // 命中了订阅源就给出「只看这个源」
     load(true);
   }, 300);
 
@@ -869,6 +973,7 @@
       searchInput.value = '';
       state.q = '';
       searchClear.hidden = true;
+      renderFilterBar();
       load(true);
     }
   });
@@ -876,6 +981,7 @@
     searchInput.value = '';
     state.q = '';
     searchClear.hidden = true;
+    renderFilterBar();
     load(true);
     searchInput.focus();
   });
@@ -996,6 +1102,7 @@
   applyViewMode();
   updateViewTitle();
   ByRead.loadFolders().then(renderNav).catch(function () {});
+  loadFeeds();          // 订阅源列表（用于"输入源名 → 只看这个源"）
   load(true);
   pollOnce();
 })();
