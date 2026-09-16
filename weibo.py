@@ -20,6 +20,8 @@ from urllib.parse import quote
 import requests
 
 import db
+import net  # noqa: F401  统一网络初始化（让 Python 用系统证书库）
+from errors import TemporaryFeedError
 
 log = logging.getLogger("byread.weibo")
 
@@ -34,8 +36,8 @@ _session = requests.Session()
 _last_call = 0.0
 
 
-class WeiboAuthError(RuntimeError):
-    """需要登录信息（对用户只暴露人话）。"""
+class WeiboAuthError(TemporaryFeedError):
+    """登录信息问题 / 临时限流（对用户只暴露人话）。属于临时失败，不该把源永久暂停。"""
 
 
 def _throttle() -> None:

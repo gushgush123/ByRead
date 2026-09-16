@@ -29,6 +29,8 @@ from urllib.parse import urlparse
 
 import requests
 
+import net  # noqa: F401  统一网络初始化
+
 import db
 
 log = logging.getLogger("byread.resolver")

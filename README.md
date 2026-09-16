@@ -250,6 +250,22 @@ P1 也顺手做了一部分：
 
 ## 七、更新记录
 
+**v0.1.10**
+
+- 修：**GitHub 每日趋势抓取失败**（报 `SSL: CERTIFICATE_VERIFY_FAILED ... unable to get local issuer certificate`）。
+  根因不在代码：本机装了会做 HTTPS 中间人的工具（实测证书签发者是 `BeyondDimension` 的
+  **SteamTools Certificate**），它把 `github.com` / `api.github.com` / `raw.githubusercontent.com`
+  的证书换成了自己的自签证书。Windows 证书库里有它的根证书（所以浏览器和 git 都正常），
+  但 Python 默认只认 certifi 里那份 Mozilla 列表，验不过就报错 —— 而 baidu、少数派、B站
+  没被中间人，所以只有 GitHub 系域名出问题。
+  现在引入 `truststore`，让 Python 也使用系统证书库，行为和浏览器一致。
+  **没有关闭证书校验**（那才是危险做法），只是信任你系统本来就信任的证书。
+- 修：**临时性失败不再把订阅源永久暂停**。微博的限流是十几分钟就自愈的，但自动刷新每 30 分钟
+  试一次，攒够 3 次就把源标成"已暂停"，等微博恢复了它也再不会被重试——用户只能手动点"恢复"。
+  现在把"限流 / 软封 / 登录态过期"归为临时失败：不计入失败次数、不暂停该源，
+  而且一次失败就返回（不重试三次，免得加重对方限流）。本次也把因此被误暂停的两个微博源恢复了。
+- 改进：`start.bat` 的依赖检查里加上 `truststore`，否则已经装过其他依赖的人不会自动补上它。
+
 **v0.1.9**
 
 - 修（重要）：**知乎的图片全被丢掉**。知乎的每张图在 HTML 里有两个副本：
@@ -427,6 +443,7 @@ ByRead/
 | 想从头再来 | 关掉程序，删掉 `instance` 文件夹，重新启动 |
 | 第一次启动时抓不到文章 | 确认网络能访问那些网站；首次抓取是后台跑的，看工具栏的进度条 |
 | `git push` 报 `SSL certificate ... unable to get local issuer certificate` | Windows 上 git 的 OpenSSL 证书后端异常（实测：即使证书包完好也会报）。执行 `git config --global http.sslBackend schannel` 改用 Windows 系统证书库即可 |
+| 某个源报 `SSL: CERTIFICATE_VERIFY_FAILED` / `unable to get local issuer certificate` | 本机有工具在做 HTTPS 中间人（例如 SteamTools 会把 `github.com` 的证书换成它自己的自签证书）。本项目已用 `truststore` 让 Python 改用系统证书库；若仍报错，执行 `python -m pip install truststore`。**更好的做法是在那类工具里关掉 HTTPS 拦截**，否则你的流量是被它解密中转的 |
 | 双击 `start.bat` 一闪而过 | 用命令行 `cd /d 项目目录` 然后敲 `start.bat`，就能看到具体报错 |
 | 中文在命令行窗口里显示成乱码 | `start.bat` 是 GBK 编码的，请用系统默认的 cmd 运行；如果你改过控制台代码页（`chcp 65001`），先改回 `chcp 936` |
 

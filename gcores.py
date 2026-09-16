@@ -19,6 +19,8 @@ from typing import Optional
 
 import requests
 
+import net  # noqa: F401  统一网络初始化
+
 log = logging.getLogger("byread.gcores")
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "

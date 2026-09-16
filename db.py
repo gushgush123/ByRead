@@ -414,19 +414,30 @@ def mark_feed_success(feed_id: int, article_count: int = 0) -> None:
         log.error("更新订阅成功状态 %s 失败：%s", feed_id, exc)
 
 
-def mark_feed_failure(feed_id: int, error: str, max_errors: int = 3) -> dict:
-    """连续失败达到阈值后自动暂停该源（is_active=0）。返回最新状态。"""
+def mark_feed_failure(feed_id: int, error: str, count_toward_pause: bool = True,
+                      max_errors: int = 3) -> dict:
+    """
+    记录一次抓取失败。
+
+    count_toward_pause=False 用于**临时性失败**（限流、软封、登录态过期）：
+    既不计入"连续失败"，也不会把源暂停 —— 否则微博那种十几分钟就恢复的限流，
+    会在自动刷新下攒够 3 次把源永久暂停，之后再也等不到自愈。
+    """
     try:
         with get_conn() as conn:
             row = _row(conn.execute("SELECT error_count FROM feeds WHERE id = ?", (feed_id,)))
-            count = (row["error_count"] if row else 0) + 1
-            is_active = 0 if count >= max_errors else 1
+            count = row["error_count"] if row else 0
+            if count_toward_pause:
+                count += 1
+                is_active = 0 if count >= max_errors else 1
+            else:
+                is_active = 1        # 不是源的错，保持可用（也顺带让被误暂停的源自愈）
             conn.execute(
                 "UPDATE feeds SET error_count = ?, is_active = ?, last_error = ?, "
                 "last_fetched = ? WHERE id = ?",
                 (count, is_active, (error or "")[:500], utc_now_iso(), feed_id),
             )
-            return {"error_count": count, "is_active": is_active}
+            return {"error_count": count, "is_active": is_active, "temporary": not count_toward_pause}
     except Exception as exc:  # noqa: BLE001
         log.error("更新订阅失败状态 %s 失败：%s", feed_id, exc)
         return {"error_count": 0, "is_active": 1}

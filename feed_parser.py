@@ -26,6 +26,8 @@ import requests
 from lxml import etree
 from lxml import html as lxml_html
 
+import net  # noqa: F401  统一网络初始化（让 Python 用系统证书库，而不是只认 certifi）
+
 log = logging.getLogger("byread.feed")
 
 UA = (

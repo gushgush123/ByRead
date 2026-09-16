@@ -14,6 +14,8 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 
+import net  # noqa: F401  统一网络初始化
+
 log = logging.getLogger("byread.github")
 
 UA = "ByRead/0.1 (local RSS reader)"

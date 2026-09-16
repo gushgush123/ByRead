@@ -9,3 +9,9 @@ requests>=2.31
 feedparser>=6.0.11
 lxml>=5.0
 readability-lxml>=0.8.1
+
+# 让 Python 使用操作系统自带的证书库（Windows 证书存储），而不是只认 certifi。
+# 有些网络环境下（例如装了 SteamTools 这类会做 HTTPS 中间人的工具）GitHub 的证书
+# 会被替换成工具自己的自签证书，此时只有系统证书库认得，Python 默认会报
+# SSLCertVerificationError → 表现为"GitHub 每日趋势抓取失败"。
+truststore>=0.9

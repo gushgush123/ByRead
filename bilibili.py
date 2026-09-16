@@ -28,6 +28,8 @@ from typing import Any, Optional
 
 import requests
 
+import net  # noqa: F401  统一网络初始化
+
 log = logging.getLogger("byread.bilibili")
 
 UA = (

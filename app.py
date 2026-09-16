@@ -28,7 +28,9 @@ from flask import Flask, Response, jsonify, render_template, request
 import db
 import cookies
 import feed_parser
+import net  # noqa: F401  统一网络初始化（让 Python 用系统证书库）
 import rsshub
+from errors import TemporaryFeedError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -111,6 +113,7 @@ def _refresh_one(feed: dict) -> dict:
     feed_id = feed["id"]
     title = feed.get("title") or feed["feed_url"]
     last_error = ""
+    temporary_error = False
     content_state = db.get_content_state(feed_id)
     for attempt in range(MAX_RETRIES):
         try:
@@ -149,13 +152,23 @@ def _refresh_one(feed: dict) -> dict:
             }
         except Exception as exc:  # noqa: BLE001
             last_error = str(exc)
+            # 临时性失败（限流/软封/登录态过期）不值得重试三次，一次就够 ——
+            # 再试只会加重对方的限流
+            if isinstance(exc, TemporaryFeedError):
+                temporary_error = True
+                break
             if attempt < MAX_RETRIES - 1:
                 time.sleep(RETRY_BACKOFF ** attempt)  # 1s, 2s
 
-    state = db.mark_feed_failure(feed_id, last_error)
+    state = db.mark_feed_failure(feed_id, last_error,
+                                 count_toward_pause=not temporary_error)
     # 失败必须留下痕迹：否则日志里一片安静，只剩一个"新增 0 篇"，无从排查
-    log.warning("抓取失败：%s（已重试 %s 次）→ %s%s", title, MAX_RETRIES, last_error,
-                "，已自动暂停该源" if state.get("is_active") == 0 else "")
+    if temporary_error:
+        log.warning("抓取暂时失败：%s → %s（临时性失败，不计入暂停，下次刷新会再试）",
+                    title, last_error)
+    else:
+        log.warning("抓取失败：%s（已重试 %s 次）→ %s%s", title, MAX_RETRIES, last_error,
+                    "，已自动暂停该源" if state.get("is_active") == 0 else "")
     return {
         "feed_id": feed_id,
         "feed": title,
@@ -163,6 +176,7 @@ def _refresh_one(feed: dict) -> dict:
         "error": last_error,
         "attempts": MAX_RETRIES,
         "paused": state.get("is_active") == 0,
+        "temporary": temporary_error,
     }
 
 

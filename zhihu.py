@@ -31,6 +31,8 @@ from typing import Callable, Optional
 import requests
 
 import db
+import net  # noqa: F401  统一网络初始化（让 Python 用系统证书库）
+from errors import TemporaryFeedError
 
 log = logging.getLogger("byread.zhihu")
 
@@ -45,7 +47,7 @@ _session = requests.Session()
 _session.headers.update({"User-Agent": UA, "Accept": "application/json"})
 
 
-class ZhihuAuthError(RuntimeError):
+class ZhihuAuthError(TemporaryFeedError):
     """需要登录信息（对用户只暴露人话）。"""
 
 
