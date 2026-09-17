@@ -49,7 +49,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "access_token": "",
     # 版本号（见下方 sync_versions）。这里只是把当前值写进设置表，方便查看与将来比对
     "schema_version": "1",
-    "content_version": "2",
+    "content_version": "3",
     # 登录信息（敏感，接口一律脱敏返回，只存本地）
     "zhihu_cookie": "",
     "weibo_cookie": "",
@@ -70,9 +70,9 @@ DEFAULT_SETTINGS: dict[str, str] = {
 # 现在把它从"各处心照不宣的写法"变成了一处机制。
 #
 # 例：以后正文提取换了解析器
-#     1) CONTENT_VERSION = 3
-#     2) 需要精确控制就挂一个函数，只把受影响的文章标旧：
-#        CONTENT_REPROCESS[3] = lambda conn: conn.execute(
+#     1) CONTENT_VERSION += 1
+#     2) 需要精确控制就挂一个函数，只把受影响的文章标旧（见下面 _rescue_zhihu_truncated）：
+#        CONTENT_REPROCESS[新版本号] = lambda conn: conn.execute(
 #            "UPDATE articles SET content_v = 0 WHERE <条件>").rowcount
 #    不挂也行，默认动作是"全部标旧"，代价只是多跑一轮正文请求。
 #
@@ -80,10 +80,57 @@ DEFAULT_SETTINGS: dict[str, str] = {
 # 又会反复触发（正文本来就没图的内容每次刷新都白跑一次请求）。
 # --------------------------------------------------------------------------- #
 SCHEMA_VERSION = 1
-CONTENT_VERSION = 2
+CONTENT_VERSION = 3
 
 SCHEMA_REPROCESS: dict[int, Callable[[sqlite3.Connection], int]] = {}
-CONTENT_REPROCESS: dict[int, Callable[[sqlite3.Connection], int]] = {}
+
+
+def _rescue_zhihu_truncated(conn) -> int:
+    """
+    v3 一次性修复：早期版本把知乎接口的**截断正文**当成完整正文存了下来。
+
+    实测：66 条知乎回答里有 12 条是半截（库里 1346 字 / 接口 6346 字，配图一张不剩），
+    而且因为"有正文 + 版本号是当前值"，刷新时永远不会再取一次。
+    这里把知乎源的正文标记为"待重取"（content_v = 0），
+    下次刷新（每次有配额，几轮跑完）就会按现在的逻辑重新取一遍并覆盖。
+
+    只动知乎源：别的平台没有证据，不要牵连。
+    以后哪个平台也发现这类问题，照抄这个函数挂到 CONTENT_REPROCESS 上即可。
+    """
+    cur = conn.execute(
+        "UPDATE articles SET content_v = 0 "
+        "WHERE COALESCE(content, '') <> '' AND feed_id IN "
+        "  (SELECT id FROM feeds WHERE feed_url LIKE 'byread://zhihu/%')"
+    )
+    return cur.rowcount
+
+
+CONTENT_REPROCESS: dict[int, Callable[[sqlite3.Connection], int]] = {
+    3: _rescue_zhihu_truncated,
+}
+
+
+def mark_content_stale(feed_id: Optional[int] = None) -> int:
+    """
+    手动把（某个源的）文章正文标记为"待重取"，下次刷新会重新去取。返回影响行数。
+
+    用途：怀疑某个平台给的是残文时（例如又发现一个新平台会截断正文），
+    先标旧再刷新，不用清库也不用重新订阅：
+        python -c "import db; print(db.mark_content_stale(feed_id=27))"
+    不传 feed_id 就是全部文章。
+    """
+    try:
+        with get_conn() as conn:
+            if feed_id:
+                cur = conn.execute("UPDATE articles SET content_v = 0 WHERE feed_id = ?", (feed_id,))
+            else:
+                cur = conn.execute("UPDATE articles SET content_v = 0")
+            rows = cur.rowcount
+        log.info("已把 %s 篇文章的正文标记为待重取（feed=%s）", rows, feed_id or "全部")
+        return rows
+    except Exception as exc:  # noqa: BLE001
+        log.error("标记正文待重取失败：%s", exc)
+        return 0
 
 _init_lock = threading.Lock()
 
@@ -632,8 +679,10 @@ def insert_article(feed_id: int, item: dict) -> bool:
                     item.get("link"),
                     item.get("author"),
                     to_iso(item.get("published")),
-                    # 入库时正文就是用当前版本的解析逻辑生成的
-                    CONTENT_VERSION if content else 0,
+                    # 入库时正文就是用当前版本的解析逻辑生成的；
+                    # 但若抓取方标了"这份正文是被源截断的"（content_incomplete），
+                    # 就写 0 = "不可信，下次刷新重取"（见 feed_parser.looks_truncated 的说明）
+                    0 if item.get("content_incomplete") else (CONTENT_VERSION if content else 0),
                     item.get("audio_url"),
                     item.get("audio_duration"),
                 ),
@@ -720,8 +769,10 @@ def update_article_if_incomplete(feed_id: int, item: dict) -> bool:
             if set_content:
                 sets.append("content = ?")
                 params.append(new_content)
-                sets.append("content_v = ?")       # 记下这份正文是用哪个版本的逻辑取的
-                params.append(CONTENT_VERSION)
+                # 记下这份正文是用哪个版本的逻辑取的；
+                # 抓取方标了"被源截断"就写 0，让下次刷新再取一次（宁可多取，不要残缺）
+                sets.append("content_v = ?")
+                params.append(0 if item.get("content_incomplete") else CONTENT_VERSION)
             if set_title:
                 sets.append("title = ?")
                 params.append(new_title)
@@ -1483,6 +1534,80 @@ def get_deleted_count() -> int:
     except Exception as exc:  # noqa: BLE001
         log.error("统计已删除文章失败：%s", exc)
         return 0
+
+
+# --------------------------------------------------------------------------- #
+# 残文修复（配合 feed_parser.CONTENT_REFETCHERS）
+#
+# "有正文、但版本号落后于当前版本" = 这份正文要么是旧逻辑取的，要么抓取方标过
+# "被源截断"。刷新只能拿到最近 N 条，所以这些老文章需要单独一条通路去补 —— 就是这两个函数。
+# --------------------------------------------------------------------------- #
+def get_stale_content_articles(feed_id: int, limit: int = 5) -> list[dict]:
+    """取该源下"有正文但正文不可信"的文章（给残文修复用）。"""
+    try:
+        with get_conn() as conn:
+            return _rows(conn.execute(
+                "SELECT id, title, link, content FROM articles "
+                "WHERE feed_id = ? AND COALESCE(content, '') <> '' "
+                "  AND COALESCE(content_v, 0) < ? AND COALESCE(is_deleted, 0) = 0 "
+                "ORDER BY published DESC, id DESC LIMIT ?",
+                (feed_id, CONTENT_VERSION, max(1, int(limit))),
+            ))
+    except Exception as exc:  # noqa: BLE001
+        log.error("读取待修复正文失败 feed=%s：%s", feed_id, exc)
+        return []
+
+
+def save_repaired_content(article_id: int, content: str, complete: bool = True) -> bool:
+    """
+    把"重取回来的正文"写回去。complete=False 时保持 content_v=0 —— 下次还会再试。
+    只在这份正文确实更完整时覆盖（避免用一份更差的把好内容冲掉）。
+    """
+    try:
+        new_content = content or ""
+        if not new_content:
+            return False
+        with get_conn() as conn:
+            row = _row(conn.execute(
+                "SELECT content, COALESCE(content_v, 0) AS v FROM articles WHERE id = ?",
+                (article_id,)))
+            if not row:
+                return False
+            old = row["content"] or ""
+            better = (not old
+                      or ("<img" not in old and "<img" in new_content)
+                      or len(new_content) > len(old) + 200)
+            if not better:
+                # 内容没变好：只把版本号推进到当前值，表示"这份已经确认过了"，别再反复取
+                if complete and int(row["v"] or 0) < CONTENT_VERSION:
+                    conn.execute("UPDATE articles SET content_v = ? WHERE id = ?",
+                                 (CONTENT_VERSION, article_id))
+                return False
+            conn.execute(
+                "UPDATE articles SET content = ?, content_v = ? WHERE id = ?",
+                (new_content, CONTENT_VERSION if complete else 0, article_id),
+            )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log.error("写回修复后的正文失败 %s：%s", article_id, exc)
+        return False
+
+
+def mark_content_checked(article_id: int) -> bool:
+    """
+    把正文标记为"已确认过"（版本号推进到当前值，不动正文内容）。
+
+    用在"抓取方明确说这条没有可取的内容"时（例如回答已被作者删除）——
+    否则修复流程每轮刷新都会再去试一次，白占配额。
+    """
+    try:
+        with get_conn() as conn:
+            conn.execute("UPDATE articles SET content_v = ? WHERE id = ?",
+                         (CONTENT_VERSION, article_id))
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log.error("标记正文已确认失败 %s：%s", article_id, exc)
+        return False
 
 
 # --------------------------------------------------------------------------- #

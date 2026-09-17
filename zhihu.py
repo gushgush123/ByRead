@@ -32,6 +32,7 @@ import requests
 
 import db
 import net  # noqa: F401  统一网络初始化（让 Python 用系统证书库）
+from feed_parser import content_refetcher
 from errors import TemporaryFeedError
 
 log = logging.getLogger("byread.zhihu")
@@ -346,24 +347,126 @@ CONTENT_SOURCES: list[tuple[str, str, dict, Callable]] = [
 ]
 
 
-def _fetch_answer_content(answer_id, cookie: str) -> Optional[str]:
-    """单条回答的正文：/api/v4/answers/{id}?include=content（实测可用）。"""
+def _fetch_answer_content(answer_id, cookie: str) -> tuple[Optional[str], bool]:
+    """
+    单条回答的正文：/api/v4/answers/{id}?include=content（实测可用）。
+
+    返回 (清洗后的正文, 是否完整/是否还会再试)。这里第二个值的含义分两种：
+      - 有正文时：正文是否完整（不完整 → 让 db 标成"下次重取"）——
+        **"不完整"必须如实报出来**，库里一旦把半截正文当成完整的存下来就再也不会重取了
+        （实测：12 篇知乎回答因此少了全部配图，见 db.CONTENT_REPROCESS 的说明）。
+      - 没正文时：True 表示"这条确实没有可取的内容"（例如回答已被删除）→ 修复流程记为已确认，
+        不再每轮都来试；False 表示这次失败（网络/限流）→ 下次刷新还会再试。
+    """
     try:
         resp = _get(f"{API}/answers/{answer_id}", cookie, {"include": "content"})
+        if resp.status_code in (404, 410):
+            return None, True           # 回答已删除：以后也不用再试了
         if resp.status_code >= 400:
-            return None
-        content = resp.json().get("content")
+            return None, False
+        data = resp.json()
+        content = data.get("content")
         if not content:
-            return None
-        from feed_parser import sanitize_html
+            return None, True
+        from feed_parser import looks_truncated, sanitize_html
 
         cleaned = sanitize_html(content, base_url="https://www.zhihu.com/")
         if not cleaned or len(_strip(cleaned, 5000)) < 40:
-            return None
-        return cleaned
+            return None, False
+
+        # 接口自带的截断标记（知乎会在内容过长/需要登录时给这些字段）
+        flagged = bool(data.get("content_need_truncated")
+                       or data.get("is_collapsed")
+                       or data.get("force_login_when_click_read_more"))
+        complete = not (flagged or looks_truncated(cleaned))
+        if not complete:
+            log.info("知乎回答 %s 的正文疑似被截断（接口标记=%s，长度=%d）",
+                     answer_id, flagged, len(cleaned))
+        return cleaned, complete
     except Exception as exc:  # noqa: BLE001
         log.info("补知乎回答正文失败 %s：%s", answer_id, exc)
-        return None
+        return None, False
+
+
+def refetch_content(link: str) -> tuple[Optional[str], bool]:
+    """
+    「残文修复」用：给一条已入库的知乎链接，把这一条的正文重新取回来。
+
+    返回 (清洗后的正文, 是否完整)。链接认不出、取不到就返回 (None, False)。
+        /answer/{id}  回答
+        /p/{id}       专栏文章
+        /pins/{id}    想法（若它分享了某条回答，取那条回答的全文 —— 和刷新时的做法一致）
+    """
+    import cookies
+
+    link = (link or "").strip()
+    cookie = cookies.get_cookie("zhihu")
+    m = re.search(r"/answer/(\d+)", link)
+    if m:
+        return _fetch_answer_content(m.group(1), cookie)
+    m = re.search(r"/pins?/(\d+)", link)
+    if m:
+        return _fetch_pin_content(m.group(1), cookie)
+    m = re.search(r"/p/(\d+)", link)
+    if m:
+        return _fetch_article_content(m.group(1), cookie)
+    return None, False
+
+
+@content_refetcher("zhihu")
+def _zhihu_refetcher(link: str) -> tuple[Optional[str], bool]:
+    """注册给 feed_parser.CONTENT_REFETCHERS 的入口（见那边的说明）。"""
+    return refetch_content(link)
+
+
+def _fetch_pin_content(pin_id, cookie: str) -> tuple[Optional[str], bool]:
+    """
+    想法正文：/api/v4/pins/{id}。content 是结构化列表，用 _structured_html 转成 HTML。
+    若这条想法分享了某条回答，**取那条回答的全文**（想法卡片自带的文字往往只是节选）。
+    """
+    try:
+        resp = _get(f"{API}/pins/{pin_id}", cookie, {})
+        if resp.status_code >= 400:
+            return None, False
+        body_html = _structured_html(resp.json().get("content"))
+        if not body_html:
+            return None, False
+        shared = _shared_answer_id(body_html)
+        if shared:
+            content, complete = _fetch_answer_content(shared, cookie)
+            if content:
+                return content, complete
+        from feed_parser import looks_truncated, sanitize_html
+
+        cleaned = sanitize_html(body_html, base_url="https://www.zhihu.com/")
+        # 想法经常就一句话（实测有 18 个字的），门槛不能按长文来
+        if not cleaned or len(_strip(cleaned, 5000)) < 10:
+            return None, True          # 确实没有可取的内容：别让修复流程反复来试
+        return cleaned, not looks_truncated(cleaned)
+    except Exception as exc:  # noqa: BLE001
+        log.info("补知乎想法正文失败 %s：%s", pin_id, exc)
+        return None, False
+
+
+def _fetch_article_content(article_id, cookie: str) -> tuple[Optional[str], bool]:
+    """专栏文章正文：/api/v4/articles/{id}?include=content。返回 (正文, 是否完整)。"""
+    try:
+        resp = _get(f"{API}/articles/{article_id}", cookie, {"include": "content"})
+        if resp.status_code >= 400:
+            return None, False
+        data = resp.json()
+        content = data.get("content")
+        if not content:
+            return None, False
+        from feed_parser import looks_truncated, sanitize_html
+
+        cleaned = sanitize_html(content, base_url="https://zhuanlan.zhihu.com/")
+        if not cleaned or len(_strip(cleaned, 5000)) < 40:
+            return None, False
+        return cleaned, not looks_truncated(cleaned)
+    except Exception as exc:  # noqa: BLE001
+        log.info("补知乎文章正文失败 %s：%s", article_id, exc)
+        return None, False
 
 
 def fetch_user_content(
@@ -425,7 +528,7 @@ def fetch_user_content(
 
     state = content_state or {}
     budget = MAX_FULLTEXT_PER_REFRESH
-    from feed_parser import sanitize_html
+    from feed_parser import looks_truncated, sanitize_html
 
     for entry in entries:
         answer_id = entry.pop("_need_answer_content", None)
@@ -441,10 +544,12 @@ def fetch_user_content(
         #    这样既不会漏（内容过时）也不会反复请求（回答本来就没图的情况）。
         if shared and budget > 0 and (
                 stale or not old_link.endswith(f"/answer/{shared}")):
-            content = _fetch_answer_content(shared, cookie)
+            content, complete = _fetch_answer_content(shared, cookie)
             if content:
                 entry["content"] = content
                 entry["summary"] = entry.get("summary") or _strip(content, 200)
+                if not complete:
+                    entry["content_incomplete"] = True   # 交给 db 标成"下次重取"
                 budget -= 1
                 time.sleep(0.2)
                 continue
@@ -454,17 +559,22 @@ def fetch_user_content(
             entry["content"] = sanitize_html(entry["content"], base_url="https://www.zhihu.com/")
             if not entry.get("summary"):
                 entry["summary"] = _strip(entry["content"], 200)
+            # 想法这类正文也可能带"展开阅读全文"（内容被折叠），一样要标出来
+            if looks_truncated(entry["content"]):
+                entry["content_incomplete"] = True
             continue
 
         # ③ 回答缺正文、或正文是旧版逻辑取的 → 重取一次
         if not answer_id or budget <= 0 or (old_len > 0 and not stale):
             continue
 
-        content = _fetch_answer_content(answer_id, cookie)
+        content, complete = _fetch_answer_content(answer_id, cookie)
         if content:
             entry["content"] = content
             if not entry.get("summary"):
                 entry["summary"] = _strip(content, 200)
+            if not complete:
+                entry["content_incomplete"] = True      # 交给 db 标成"下次重取"
             budget -= 1
         time.sleep(0.2)
 

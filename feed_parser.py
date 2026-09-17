@@ -16,6 +16,7 @@ feed_parser.py —— 抓取、解析、正文提取、HTML 清洗
 from __future__ import annotations
 
 import html as html_mod
+import importlib
 import logging
 import re
 from typing import Callable, Optional
@@ -259,6 +260,46 @@ def html_to_text(raw_html: Optional[str], limit: int = 300) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# 正文完整性（"这份正文是不是被源截断了"）
+#
+# 为什么需要它：入库的正文有可能是**被截断的半截**（源只给了摘要级片段，
+# 或者当时走的是另一条取正文的路），而库里只记了"正文版本号"，
+# 于是系统以为它是完整的，**永远不会再取一次** —— 实测就是这么丢了 12 篇知乎回答的配图
+# （库里 1346 字 vs 接口 6346 字，图一张不剩）。见 db.CONTENT_REPROCESS。
+#
+# 通用做法分三步，任何平台都能用：
+#   1. 判定：平台模块发现"内容不完整"时，给条目加一个字段 item["content_incomplete"] = True；
+#      自己判断不了就用这里的 looks_truncated()，或者用平台接口自己的标记
+#      （知乎的 content_need_truncated、微博的 isLongText 之类）。
+#   2. 表达：db 层看到这个字段就把 content_v 写成 0 而不是当前版本号 ——
+#      也就是复用已有的"这正文不可信，下次刷新重取"语义，不用新增字段。
+#   3. 重取：刷新时本来就会重取 content_v < CONTENT_VERSION 的条目；
+#      取回来若明显更完整，update_article_if_incomplete 会覆盖旧内容。
+# 误判的代价也很小：至多让这一篇下次刷新多取一次，取回来没变化就把版本号推进到当前值。
+# --------------------------------------------------------------------------- #
+TRUNCATION_MARKERS = (
+    "展开阅读全文", "阅读全文", "展开全文", "查看全文", "查看全部", "点击展开",
+    "read more", "continue reading", "show more", "see more",
+)
+
+
+def looks_truncated(html_text: Optional[str]) -> bool:
+    """
+    粗判"这段正文像是被截断的"。
+
+    只看**结尾那一小段**（不然正文中间提到"阅读全文"就会误判），
+    并且要求正文已经有一定长度（太短的内容本来就会因为"太短"被别的机制处理）。
+    """
+    if not html_text:
+        return False
+    text = html_to_text(html_text, 200000).strip()
+    if len(text) < 40:
+        return False
+    tail = text[-30:].lower()
+    return any(marker in tail for marker in TRUNCATION_MARKERS)
+
+
+# --------------------------------------------------------------------------- #
 # 本地生成的源（byread://）
 #
 # 平台名 → 处理函数 的**注册表**。以前这里是一条 if/elif 长链，加一个平台就要
@@ -351,6 +392,58 @@ def _local_gcores(parts, limit, content_state, feed_url):
 
 def is_local_feed(feed_url: str) -> bool:
     return bool(feed_url) and feed_url.startswith(LOCAL_SCHEME)
+
+
+# --------------------------------------------------------------------------- #
+# 残文修复：平台名 → "按一条链接重取这一条正文"的函数
+#
+# 为什么单独有这么一条通路：刷新只能拿到**最近 N 条**，老文章早就滚出窗口了。
+# 早期版本把知乎接口的截断正文当完整正文存下来（实测 12 篇少了全部配图），
+# 光把它们标成"待重取"没用 —— 它们再也不会出现在抓取窗口里，没人去取。
+# 所以每个平台可以登记一个"给一条已入库的链接，把这一条的正文重新取回来"的函数：
+#     @content_refetcher("zhihu")
+#     def refetch_content(link) -> tuple[Optional[str], bool]   # (正文, 是否完整)
+# 刷新时会顺带把该源"有正文但标记为待重取"的老文章补一遍（有配额，几轮跑完）。
+# --------------------------------------------------------------------------- #
+ContentRefetcher = Callable[[str], tuple]
+
+
+CONTENT_REFETCHERS: dict[str, ContentRefetcher] = {}
+
+
+def content_refetcher(platform: str):
+    """把一个函数登记成某个平台的"按链接重取正文"实现。"""
+    def register(fn: ContentRefetcher) -> ContentRefetcher:
+        CONTENT_REFETCHERS[platform] = fn
+        return fn
+
+    return register
+
+
+def platform_of(feed_url: str) -> str:
+    """从 byread://<平台>/... 里取出平台名；不是本地源就返回空串。"""
+    if not is_local_feed(feed_url):
+        return ""
+    parts = [p for p in feed_url[len(LOCAL_SCHEME):].strip("/").split("/") if p]
+    return parts[0] if parts else ""
+
+
+def get_content_refetcher(platform: str) -> Optional[ContentRefetcher]:
+    """
+    取某个平台的"重取正文"函数；没有就返回 None。
+
+    注意：平台的注册是在**模块被导入时**发生的，而各平台模块一直是懒加载的
+    （避免循环依赖、也避免没用到的平台白加载）。所以查表前先把同名模块导进来 ——
+    平台名与模块名一致（bilibili / zhihu / weibo / gcores / github），这条约定本来就在用。
+    """
+    if not platform:
+        return None
+    if platform not in CONTENT_REFETCHERS:
+        try:
+            importlib.import_module(platform)
+        except Exception as exc:  # noqa: BLE001
+            log.info("加载平台模块 %s 失败（该平台无法修复正文）：%s", platform, exc)
+    return CONTENT_REFETCHERS.get(platform)
 
 
 def fetch_local_feed(feed_url: str, limit: int = 20,

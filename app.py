@@ -195,6 +195,11 @@ SEED_FEEDS = [
 MAX_RETRIES = 3
 RETRY_BACKOFF = 2  # 秒，指数退避
 
+# 每次刷新最多修几篇"残文"（正文被源截断过的老文章）。
+# 刷新只能拿到最近 N 条，老文章要靠这条通路补；有配额是为了别把对方接口打急，
+# 几轮刷新就把历史欠账还清了（没欠账时一次请求都不发）。
+REPAIR_CONTENT_PER_REFRESH = 6
+
 
 # --------------------------------------------------------------------------- #
 # 后台刷新状态机
@@ -254,6 +259,42 @@ def _cookie_requirement(feed_url: str) -> Optional[str]:
     return None
 
 
+def _repair_stale_content(feed: dict, budget: int = REPAIR_CONTENT_PER_REFRESH) -> int:
+    """
+    残文修复：把该源"有正文但不可信"的老文章重新取一遍正文。返回修好的篇数。
+
+    为什么需要单独一条通路：刷新只能拿到最近 N 条，老文章早滚出窗口了 ——
+    光把它们标成"待重取"没用，没人会去取（实测：12 篇知乎回答因此少了全部配图）。
+    具体怎么取由各平台自己实现（feed_parser.CONTENT_REFETCHERS），这里只负责调度与配额。
+    """
+    platform = feed_parser.platform_of(feed.get("feed_url") or "")
+    refetch = feed_parser.get_content_refetcher(platform)
+    if not refetch:
+        return 0
+    pending = db.get_stale_content_articles(feed["id"], limit=budget)
+    fixed = 0
+    for article in pending:
+        try:
+            content, complete = refetch(article.get("link") or "")
+        except Exception as exc:  # noqa: BLE001
+            log.info("残文修复失败 #%s：%s", article.get("id"), exc)
+            continue
+        if content:
+            if db.save_repaired_content(article["id"], content, complete):
+                fixed += 1
+                log.info("残文修复：%s（#%s）%d 字 → %d 字",
+                         (article.get("title") or "")[:30], article["id"],
+                         len(article.get("content") or ""), len(content))
+        elif complete:
+            # 抓取方明确说"这条没有可取的内容"（例如回答已被删除）：
+            # 记为已确认，否则每轮刷新都会再来试一次，白占配额
+            db.mark_content_checked(article["id"])
+            log.info("残文修复：%s（#%s）确认无可取内容，不再重试",
+                     (article.get("title") or "")[:30], article["id"])
+        time.sleep(0.2)          # 别把对方接口打急了
+    return fixed
+
+
 def _refresh_one(feed: dict) -> dict:
     """
     抓取单个源，带重试与错误计数。返回结果字典（不抛异常）。
@@ -289,12 +330,16 @@ def _refresh_one(feed: dict) -> dict:
                 db.update_feed_meta(feed_id, site_url=data["site_url"])
 
             db.mark_feed_success(feed_id)
+            # 顺带修残文：刷新只能拿到最近 N 条，老文章里那些"被源截断过的正文"
+            # 需要单独这条通路补（没欠账时一次请求都不发，见 _repair_stale_content）
+            repaired = _repair_stale_content(feed)
             return {
                 "feed_id": feed_id,
                 "feed": title,
                 "status": "success",
                 "new": new_count,
                 "filled": filled_count,
+                "repaired": repaired,
                 "total": len(data.get("entries") or []),
                 "attempts": attempt + 1,
             }
