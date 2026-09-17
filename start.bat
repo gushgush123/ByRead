@@ -35,7 +35,7 @@ rem 注意：truststore 也要检查。它负责让 Python 使用系统证书库；缺了它，
 rem 被本机代理工具（如 SteamTools）做中间人的站点会证书验证失败，
 rem 表现为"GitHub 每日趋势抓取失败"。
 echo [1/2] 检查依赖...
-python -c "import flask, feedparser, readability, lxml, requests, truststore" >nul 2>nul
+python -c "import flask, feedparser, readability, lxml, requests, truststore, trafilatura" >nul 2>nul
 if errorlevel 1 (
   echo       缺少依赖，正在安装（第一次运行需要联网，大约一两分钟）...
   python -m pip install -r requirements.txt

@@ -3,7 +3,7 @@ feed_parser.py —— 抓取、解析、正文提取、HTML 清洗
 
 职责：
     1. fetch_feed(url)          → 统一抓取入口（含本地生成的源，如 byread://bilibili/dynamic/xxx）
-    2. extract_article_content  → 用 readability 提取正文
+    2. extract_article_content  → 抓页面 + 提取正文（readability → trafilatura 兜底）
     3. sanitize_html            → 白名单清洗（服务端第一道防线，前端再用 DOMPurify 兜底）
 
 安全红线落地方式：
@@ -615,14 +615,18 @@ def _browser_headers(url: str) -> dict:
     return headers
 
 
-def extract_article_content(url: str, timeout: int = TIMEOUT,
-                            block_images: bool = False) -> Optional[str]:
+# 正文提取的门槛：清洗后的纯文本短于这个长度，就当"这篇没提到正文"
+MIN_CONTENT_CHARS = 80
+
+
+def _fetch_page(url: str, timeout: int) -> Optional[tuple[str, str]]:
     """
-    打开原文链接，用 readability 提取正文；失败返回 None（前端回退显示摘要）。
-    知乎/微博这类站点需要登录态，会带上对应平台的 Cookie。
+    抓原文页面，返回 (HTML, 最终地址)；失败返回 None（不抛异常）。
+
+    **只有这一层联网。** 提取一律是对"已经抓好的 HTML"做纯处理 ——
+    这样 timeout / 代理 / UA / Cookie 全是我们说了算，不会因为换/加了提取库就绕开它们
+    （trafilatura 自带 fetch_url，本文件一律不用它）。
     """
-    if not url or not url.lower().startswith(("http://", "https://")):
-        return None
     try:
         resp = _requests.get(url, timeout=timeout, allow_redirects=True,
                              headers=_browser_headers(url))
@@ -634,25 +638,135 @@ def extract_article_content(url: str, timeout: int = TIMEOUT,
             return None
         if not resp.encoding or resp.encoding.lower() in ("iso-8859-1", "ascii"):
             resp.encoding = resp.apparent_encoding or "utf-8"
-        page_html = resp.text
+        return resp.text, resp.url
     except Exception as exc:  # noqa: BLE001
         log.info("正文提取请求失败 %s：%s", url, exc)
         return None
 
+
+def _clean_and_check(raw_html: Optional[str], base_url: str,
+                     block_images: bool) -> Optional[str]:
+    """
+    提取结果**统一从这里出去**：清洗 → 太短算失败。返回 None 表示"这篇没提到"。
+
+    两个引擎都走这一条路，好处是清洗规则只有一份，
+    不会出现"某个引擎的结果绕过了白名单"这种事。
+    """
+    if not raw_html:
+        return None
+    cleaned = sanitize_html(raw_html, base_url=base_url, block_images=block_images)
+    if len(html_to_text(cleaned, 5000)) < MIN_CONTENT_CHARS:
+        return None
+    return cleaned
+
+
+def _looks_like_article_list(cleaned: str) -> bool:
+    """
+    识别"链接汤"：段落很多、但每段都极短。
+
+    这是实测踩到的坑：B 站/知乎这类内容靠 JS 渲染的页面，HTML 里根本没有正文，
+    trafilatura 会把手边的"相关视频 / 推荐阅读"那一列标题当成正文提出来。
+    人工对比过两边：
+        推荐位列表：20~41 段，最长的一段 18~73 字
+        真正文（含短回答）：单段 136~143 字，或 76 段里最长 47 字
+    所以判据取"段落 ≥10 且最长的一段 <100 字"——
+    它只在 trafilatura 这条兜底路径上生效，readability 的结果一个都不拦，
+    避免"本来能看的正文反而被这条规则挡掉"。
+    """
+    try:
+        doc = lxml_html.fromstring(f"<div>{cleaned}</div>")
+        texts = [" ".join((el.text_content() or "").split()) for el in doc.xpath(".//p")]
+        texts = [t for t in texts if t]
+        if len(texts) < 10:
+            return False
+        return max(len(t) for t in texts) < 100
+    except Exception as exc:  # noqa: BLE001
+        log.info("判断是否链接汤失败（按正文处理）：%s", exc)
+        return False
+
+
+def _extract_by_trafilatura(page_html: str, base_url: str,
+                            block_images: bool) -> Optional[str]:
+    """
+    二级兜底：trafilatura。**只调它的提取函数**，HTML 由我们抓好传进去 ——
+    绝不用它自带的 fetch_url（那会绕过我们的 timeout / 代理 / UA / Cookie）。
+    输出要 HTML（不是 txt / markdown），才能和 readability 共用同一个清洗出口。
+    """
+    try:
+        import trafilatura
+
+        html = trafilatura.extract(
+            page_html,
+            url=base_url,
+            output_format="html",
+            include_images=not block_images,   # 它默认 False，不显式打开会一张图都不剩
+            include_links=True,
+            include_formatting=True,
+            include_tables=True,
+            favor_recall=True,                 # 它只在"readability 没提到"时上场，宁可多提
+        ) or None
+    except Exception as exc:  # noqa: BLE001
+        log.info("trafilatura 提取失败 %s：%s", base_url, exc)
+        return None
+
+    if html and _looks_like_article_list(html):
+        # 提到了推荐位列表 —— 这比"回退到摘要"更糟，宁可当没提到
+        log.info("trafilatura 只提到一串列表（疑似推荐位），按失败处理：%s", base_url)
+        return None
+    return html
+
+
+def extract_from_html(page_html: str, base_url: str,
+                      block_images: bool = False) -> tuple[Optional[str], str]:
+    """
+    纯提取（不联网）。返回 (清洗后的正文, 用了哪个引擎)；都没提到返回 (None, "none")。
+
+    顺序：readability（快而准，绝大多数站够用）
+          → 太短或报错 → trafilatura（对知乎、少数派这类结构复杂的页面更稳）
+          → 还是不行就 None，由前端回退显示摘要。
+
+    readability 达标时**不会再跑 trafilatura** —— 所以这个改造只会把原来失败的补上，
+    不可能让原来成功的变差。
+    """
     try:
         from readability import Document
 
-        doc = Document(page_html)
-        summary = doc.summary(html_partial=True)
+        summary = Document(page_html).summary(html_partial=True)
     except Exception as exc:  # noqa: BLE001
-        log.info("readability 提取失败 %s：%s", url, exc)
-        return None
+        log.info("readability 提取失败 %s：%s", base_url, exc)
+        summary = None
 
-    cleaned = sanitize_html(summary, base_url=resp.url, block_images=block_images)
-    if len(html_to_text(cleaned, 5000)) < 80:
-        # 提取到的内容太短，视为失败，让前端回退到摘要
+    cleaned = _clean_and_check(summary, base_url, block_images)
+    if cleaned:
+        return cleaned, "readability"
+
+    cleaned = _clean_and_check(_extract_by_trafilatura(page_html, base_url, block_images),
+                               base_url, block_images)
+    if cleaned:
+        return cleaned, "trafilatura"
+    return None, "none"
+
+
+def extract_article_content(url: str, timeout: int = TIMEOUT,
+                            block_images: bool = False) -> Optional[str]:
+    """
+    打开原文链接并提取正文；失败返回 None（前端回退显示摘要），**不抛异常**。
+    知乎/微博这类站点需要登录态，会带上对应平台的 Cookie。
+    """
+    if not url or not url.lower().startswith(("http://", "https://")):
         return None
-    return cleaned
+    page = _fetch_page(url, timeout)
+    if not page:
+        return None
+    page_html, final_url = page
+    content, engine = extract_from_html(page_html, final_url, block_images)
+    if not content:
+        return None
+    # 记下是哪个引擎提的、提了多少字：以后"这篇怎么只有一点点"能直接从日志看出来
+    # （这里用一个大 limit 量全文长度，别被 html_to_text 的默认截断骗了）
+    log.info("正文提取成功（%s，%d 字）：%s", engine,
+             len(html_to_text(content, 1000000)), final_url)
+    return content
 
 
 def probe_feed_url(url: str) -> dict:
