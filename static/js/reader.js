@@ -124,12 +124,14 @@
       a.target = '_blank';
       a.rel = 'noopener noreferrer';
     });
-    // 图片：微博/B 站的图床有防盗链，浏览器直连会被 403，统一走本地代理
+    // 图片：微博/B 站/少数派的图床有防盗链，浏览器直连会被 403，统一走本地代理。
+    // 代理帮不上的（有些图床只要求"有 Referer"）由 imageFallback 用 origin 策略再试一次。
     bodyEl.querySelectorAll('img').forEach(function (img) {
       const src = img.getAttribute('src');
       if (src) img.src = ByRead.imageUrl(src);
       img.loading = 'lazy';
       img.referrerPolicy = 'no-referrer';
+      ByRead.imageFallback(img);
     });
   }
 

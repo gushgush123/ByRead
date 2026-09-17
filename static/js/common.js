@@ -515,21 +515,71 @@
   };
 
   /* ---------------- 图片地址 ---------------- */
-  // 微博图床(sinaimg) 和 B 站图床(hdslb) 有防盗链：浏览器从 127.0.0.1 请求会被 403，
-  // 所以这些域名的图片走本地代理，其余原样使用。
-  const PROXY_HOSTS = ['hdslb.com', 'sinaimg.cn', 'zhimg.com', 'gcores.com'];
+  // 微博图床(sinaimg)、B 站图床(hdslb)、少数派(cdnfile.sspai.com) 都有防盗链：
+  // 浏览器从 127.0.0.1 请求会被 403，所以这些域名的图片走本地代理（服务端带正确的 Referer 去取），
+  // 其余原样使用。
+  // 名单由服务端通过 <meta name="image-proxy-hosts"> 注入（唯一来源），
+  // 页面里读不到时才退回下面这份兜底 —— 两处各维护一份的话，漏一个就是整页图片全挂。
+  const PROXY_HOSTS_FALLBACK = ['hdslb.com', 'sinaimg.cn', 'zhimg.com', 'gcores.com', 'sspai.com'];
+
+  function proxyHosts() {
+    try {
+      const meta = document.querySelector('meta[name="image-proxy-hosts"]');
+      const list = meta && meta.getAttribute('content');
+      if (list) {
+        const parsed = list.split(',').map(function (s) { return s.trim().toLowerCase(); })
+          .filter(Boolean);
+        if (parsed.length) return parsed;
+      }
+    } catch (e) { /* 读不到就用兜底 */ }
+    return PROXY_HOSTS_FALLBACK;
+  }
 
   ByRead.imageUrl = function (url) {
     if (!url) return '';
     try {
       const abs = new URL(url, window.location.origin);
       const host = abs.hostname.toLowerCase();
-      const needProxy = PROXY_HOSTS.some(function (h) {
+      const needProxy = proxyHosts().some(function (h) {
         return host === h || host.endsWith('.' + h);
       });
       if (needProxy) return '/api/image?u=' + encodeURIComponent(abs.href);
     } catch (e) { /* 非法地址就原样返回，交给浏览器处理 */ }
     return url;
+  };
+
+  /**
+   * 给 <img> 挂上"加载失败再试一次"的兜底。
+   *
+   * 为什么需要：阅读页默认给图片加 referrerpolicy="no-referrer"（隐私考虑），
+   * 但有一类图床**只要求"有 Referer"**——实测 cdnfile.sspai.com 带任意 Referer 都 200，
+   * 完全不带就 403。这种域名不该为它一个个加进代理名单，所以失败时用 origin 策略重试一次
+   * （Referer 只会是 http://127.0.0.1:5000，不泄露任何个人网址），还不行就交给调用方的 onerror。
+   */
+  ByRead.imageFallback = function (img, onFail) {
+    const original = img.getAttribute('src') || '';
+
+    function cleanup() {
+      img.removeEventListener('error', onError);
+      img.removeEventListener('load', cleanup);
+    }
+
+    function onError() {
+      if (!img.dataset.retried) {
+        // 第一次失败：换成 origin 策略再试一次
+        img.dataset.retried = '1';
+        img.removeAttribute('src');      // 先摘掉再设回去，浏览器才会真的重新发起请求
+        img.referrerPolicy = 'origin';   // 只发"来源"，不带本地路径细节
+        img.src = original;
+        return;                          // 监听器留着，第二次失败才算真失败
+      }
+      cleanup();                         // 两次都不行：交给调用方（缩略图会换成占位块）
+      if (typeof onFail === 'function') onFail();
+    }
+
+    img.addEventListener('error', onError);
+    img.addEventListener('load', cleanup);
+    return img;
   };
 
   /* ---------------- 主题 ---------------- */

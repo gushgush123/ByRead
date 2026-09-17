@@ -4,6 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}白读 · ByRead{% endblock %}</title>
+  {# 哪些图床要走本地代理：由服务端注入，前端不再自己维护一份（两边名单不一致会出"图片全挂"） #}
+  <meta name="image-proxy-hosts" content="{{ image_proxy_hosts|join(',') }}">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📖</text></svg>">
   <script>
     /* 主题预置：避免刷新时白屏闪烁。localStorage 优先于服务端设置（切换时两者都会写） */

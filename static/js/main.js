@@ -533,7 +533,8 @@
       img.alt = '';
       img.loading = 'lazy';
       img.referrerPolicy = 'no-referrer';
-      img.addEventListener('error', placeholder);
+      // 先"失败再用 origin Referer 重试一次"，两次都不行才退到占位块
+      ByRead.imageFallback(img, placeholder);
       thumb.appendChild(img);
     } else {
       placeholder();

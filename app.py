@@ -440,6 +440,9 @@ def inject_globals():
         "theme": db.get_setting("theme") or "light",
         "view_mode": db.get_setting("view_mode") or "card",
         "sidebar_open": (db.get_setting("sidebar_open") or "true").lower() == "true",
+        # 哪些图床要走本地代理：前端从 meta 标签读（见 base.html），
+        # 这样"服务端白名单"和"前端判断"永远一致 —— 以前两处各写一份，漏一个就是整页图片全挂
+        "image_proxy_hosts": IMAGE_PROXY_HOSTS,
     }
 
 
@@ -1283,12 +1286,20 @@ def api_export_markdown():
 #
 #   所以本地做一层代理：服务端带着正确的 Referer 取图，再回给浏览器。
 #   只允许已知图床域名（同时也就挡住了把接口当内网扫描器用的可能），限制大小并做内存缓存。
-IMAGE_PROXY_HOSTS = ("hdslb.com", "sinaimg.cn", "zhimg.com", "gcores.com")
+#
+#   ⚠️ 这份名单必须覆盖"不带 Referer 就取不到图"的站点，判断依据是实测：
+#      "不带 Referer 403、带上站点 Referer 200" 的一律列进来。
+#      实测踩过：cdnfile.sspai.com **只要求"有 Referer"**（带任意 Referer 都 200，不带就 403），
+#      而阅读页给所有图片加了 referrerpolicy="no-referrer"，于是少数派的配图全挂（整页白框）。
+#   前端不再自己维护一份域名表 —— 由服务端通过 base.html 的 meta 标签注入（见 base.html），
+#   免得两处名单不一致又出同一类问题。
+IMAGE_PROXY_HOSTS = ("hdslb.com", "sinaimg.cn", "zhimg.com", "gcores.com", "sspai.com")
 IMAGE_REFERERS = {
     "hdslb.com": "https://www.bilibili.com/",
     "sinaimg.cn": "https://m.weibo.cn/",
     "zhimg.com": "https://www.zhihu.com/",
     "gcores.com": "https://www.gcores.com/",
+    "sspai.com": "https://sspai.com/",
 }
 IMAGE_TTL = 6 * 3600
 IMAGE_CACHE_MAX = 300
