@@ -18,7 +18,7 @@ from __future__ import annotations
 import html as html_mod
 import logging
 import re
-from typing import Optional
+from typing import Callable, Optional
 from urllib.parse import urljoin, urlparse
 
 import feedparser
@@ -260,7 +260,95 @@ def html_to_text(raw_html: Optional[str], limit: int = 300) -> str:
 
 # --------------------------------------------------------------------------- #
 # 本地生成的源（byread://）
+#
+# 平台名 → 处理函数 的**注册表**。以前这里是一条 if/elif 长链，加一个平台就要
+# 在链路中间插一段；现在加平台 = 写一个函数 + 一个 @local_handler("平台名")，
+# fetch_local_feed 只负责解析地址和查表。
+#
+# 处理函数签名统一为 (parts, limit, content_state, feed_url) -> dict，
+# 其中 parts = ["平台", "类型", "参数"...]（已经去掉空段）。
+# 类型不认识时**要抛 ValueError**（以前是整条链走完落到最后那行 raise，
+# 现在由各自的处理函数负责，报错信息保持一致）。
 # --------------------------------------------------------------------------- #
+LocalFeedHandler = Callable[[list, int, Optional[dict], str], dict]
+
+LOCAL_FEED_HANDLERS: dict[str, LocalFeedHandler] = {}
+
+
+def local_handler(platform: str):
+    """把一个函数登记成某个 byread:// 平台的处理函数。"""
+    def register(fn: LocalFeedHandler) -> LocalFeedHandler:
+        LOCAL_FEED_HANDLERS[platform] = fn
+        return fn
+
+    return register
+
+
+def _unknown_local_feed(feed_url: str):
+    """统一的报错（和以前那条长链走完落到最后一行时的信息保持一致）。"""
+    raise ValueError(f"未知的本地源类型：{feed_url}")
+
+
+@local_handler("bilibili")
+def _local_bilibili(parts, limit, content_state, feed_url):
+    kind = parts[1] if len(parts) > 1 else ""
+    import bilibili      # 局部导入，避免循环依赖
+
+    if kind == "dynamic" and len(parts) >= 3:
+        return bilibili.fetch_user_dynamics(int(parts[2]), limit=limit)
+    if kind == "popular":
+        return bilibili.fetch_popular(limit=limit)
+    _unknown_local_feed(feed_url)
+
+
+@local_handler("zhihu")
+def _local_zhihu(parts, limit, content_state, feed_url):
+    kind = parts[1] if len(parts) > 1 else ""
+    if kind == "daily":
+        import zhihu
+        # 知乎日报每篇正文要单独请求一次，所以条数不宜太多
+        return zhihu.fetch_daily(limit=min(limit, 12), days=2, content_state=content_state)
+    if kind == "people" and len(parts) >= 3:
+        import cookies
+        import zhihu
+        return zhihu.fetch_user_content(
+            parts[2], limit=limit, cookie=cookies.get_cookie("zhihu"),
+            content_state=content_state,
+        )
+    _unknown_local_feed(feed_url)
+
+
+@local_handler("weibo")
+def _local_weibo(parts, limit, content_state, feed_url):
+    kind = parts[1] if len(parts) > 1 else ""
+    if kind == "user" and len(parts) >= 3:
+        import cookies
+        import weibo
+        return weibo.fetch_user_weibo(
+            parts[2], limit=limit, cookie=cookies.get_cookie("weibo"),
+            content_state=content_state,
+        )
+    _unknown_local_feed(feed_url)
+
+
+@local_handler("github")
+def _local_github(parts, limit, content_state, feed_url):
+    kind = parts[1] if len(parts) > 1 else ""
+    if kind == "trending":
+        import github
+        return github.fetch_trending(limit=limit)
+    _unknown_local_feed(feed_url)
+
+
+@local_handler("gcores")
+def _local_gcores(parts, limit, content_state, feed_url):
+    # 机核只有 latest 一种（RSS 被 WAF 拦，改走官方 JSON API）
+    if len(parts) >= 2:
+        import gcores
+        return gcores.fetch_gcores(limit=limit)
+    _unknown_local_feed(feed_url)
+
+
 def is_local_feed(feed_url: str) -> bool:
     return bool(feed_url) and feed_url.startswith(LOCAL_SCHEME)
 
@@ -276,56 +364,19 @@ def fetch_local_feed(feed_url: str, limit: int = 20,
         byread://weibo/user/{uid}         某人的微博（需登录信息）
         byread://github/trending          GitHub 趋势
         byread://gcores/latest            机核
+
+    平台分派走 LOCAL_FEED_HANDLERS 注册表（见上）；加平台不用改这个函数。
     content_state：{guid: 是否已有正文}，用来跳过重复请求、并逐次补齐缺失的正文。
     """
     path = feed_url[len(LOCAL_SCHEME):].strip("/")
     parts = [p for p in path.split("/") if p]
+    if not parts:
+        raise ValueError(f"未知的本地源类型：{feed_url}")
 
-    if len(parts) >= 3 and parts[0] == "bilibili" and parts[1] == "dynamic":
-        import bilibili  # 局部导入，避免循环依赖
-
-        return bilibili.fetch_user_dynamics(int(parts[2]), limit=limit)
-
-    if len(parts) >= 2 and parts[0] == "bilibili" and parts[1] == "popular":
-        import bilibili
-
-        return bilibili.fetch_popular(limit=limit)
-
-    if len(parts) >= 2 and parts[0] == "zhihu" and parts[1] == "daily":
-        import zhihu
-
-        # 知乎日报每篇正文要单独请求一次，所以条数不宜太多
-        return zhihu.fetch_daily(limit=min(limit, 12), days=2, content_state=content_state)
-
-    if len(parts) >= 3 and parts[0] == "zhihu" and parts[1] == "people":
-        import cookies
-        import zhihu
-
-        return zhihu.fetch_user_content(
-            parts[2], limit=limit, cookie=cookies.get_cookie("zhihu"),
-            content_state=content_state,
-        )
-
-    if len(parts) >= 3 and parts[0] == "weibo" and parts[1] == "user":
-        import cookies
-        import weibo
-
-        return weibo.fetch_user_weibo(
-            parts[2], limit=limit, cookie=cookies.get_cookie("weibo"),
-            content_state=content_state,
-        )
-
-    if len(parts) >= 2 and parts[0] == "github" and parts[1] == "trending":
-        import github
-
-        return github.fetch_trending(limit=limit)
-
-    if len(parts) >= 2 and parts[0] == "gcores":
-        import gcores
-
-        return gcores.fetch_gcores(limit=limit)
-
-    raise ValueError(f"未知的本地源类型：{feed_url}")
+    handler = LOCAL_FEED_HANDLERS.get(parts[0])
+    if handler is None:
+        raise ValueError(f"未知的本地源类型：{feed_url}")
+    return handler(parts, limit, content_state, feed_url)
 
 
 def local_feed_url(platform: str, kind: str, param) -> str:

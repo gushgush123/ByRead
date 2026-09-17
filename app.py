@@ -2,6 +2,8 @@
 app.py —— 白读 · ByRead 主应用
 
 运行：python app.py  然后访问 http://127.0.0.1:5000
+监听地址可用 BYREAD_HOST / BYREAD_PORT 覆盖（默认只监听本机，见下方 _resolve_bind）；
+访问口令可用 BYREAD_TOKEN 打开（默认为空 = 不鉴权，见下方 _auth_guard）。
 
 架构要点：
     1. 抓取一律走后台线程，"刷新"接口立即返回，前端轮询进度
@@ -15,17 +17,19 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
 import re
+import secrets
 import threading
 import time
 import xml.etree.ElementTree as ET
 import zipfile
 from datetime import datetime, timezone
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 import requests
-from flask import Flask, Response, jsonify, render_template, request
+from flask import Flask, Response, jsonify, redirect, render_template, request
 
 import db
 import cookies
@@ -48,6 +52,138 @@ app = Flask(__name__)
 # 但 curl 看接口、看日志时人眼友好得多。
 app.json.ensure_ascii = False
 app.config["TEMPLATES_AUTO_RELOAD"] = True
+
+
+# --------------------------------------------------------------------------- #
+# 监听地址（为将来的多端 / 托管留的口子，现在不改任何行为）
+#
+# 默认仍然是 127.0.0.1:5000 —— **只监听本机**，局域网里别的设备访问不到，这是有意的安全默认。
+# 想让手机 / 另一台电脑访问，用环境变量打开（Windows 下在启动前 set 一下）：
+#     set BYREAD_HOST=0.0.0.0
+#     set BYREAD_PORT=8080
+#     python app.py
+# 也可以写进数据库设置（bind_host / bind_port），环境变量优先。
+# 值不合法就退回默认并记一条日志 —— 地址写错不该让程序起不来。
+# --------------------------------------------------------------------------- #
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 5000
+
+
+def _resolve_bind() -> tuple[str, int]:
+    """解析监听地址：环境变量 > 设置表 > 默认值。"""
+    host = (os.environ.get("BYREAD_HOST") or db.get_setting("bind_host")
+            or DEFAULT_HOST).strip()
+    raw_port = (os.environ.get("BYREAD_PORT") or db.get_setting("bind_port") or "").strip()
+    port = DEFAULT_PORT
+    if raw_port:
+        try:
+            port = int(raw_port)
+            if not 1 <= port <= 65535:
+                raise ValueError("端口要在 1~65535 之间")
+        except ValueError as exc:
+            log.warning("BYREAD_PORT / bind_port 不是合法端口（%r：%s），改用默认 %d",
+                        raw_port, exc, DEFAULT_PORT)
+            port = DEFAULT_PORT
+    return (host or DEFAULT_HOST), port
+
+
+# --------------------------------------------------------------------------- #
+# 鉴权钩子（**默认放行**）
+#
+# 现在完全不影响使用：没配口令时这个钩子就是一行 no-op。
+# 之所以做成全局钩子而不是改每个路由，是为了将来要挂到公网/多端时，
+# 只打开一个开关就全部生效 —— 前端代码一行都不用动（口令记在 Cookie 里，浏览器自动带上）。
+#
+# 启用方式（二选一，环境变量优先）：
+#     set BYREAD_TOKEN=一串足够长的随机字符        （Windows）
+#     export BYREAD_TOKEN=...                    （bash）
+#   或者把 access_token 写进设置表。
+# 生效后：
+#   - 浏览器：第一次访问 http://host:port/?token=<口令>，之后靠 Cookie，地址栏里不会留口令
+#   - 程序化调用（脚本 / 将来的移动端）：带 Authorization: Bearer <口令>
+# /static/ 与 favicon 不校验，否则登录页自己都加载不出来。
+# --------------------------------------------------------------------------- #
+AUTH_COOKIE = "byread_token"
+AUTH_EXEMPT_PREFIXES = ("/static/", "/favicon.ico")
+
+# 启动时解析一次（refresh_auth_token 会在 bootstrap 之后再读一次设置表），
+# 这样每个请求都不用查数据库 —— 不启用鉴权时是真正的零开销
+_AUTH_TOKEN = (os.environ.get("BYREAD_TOKEN") or "").strip()
+
+_LOGIN_PAGE = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<title>白读 · 需要访问口令</title><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#f5f5f7;
+color:#1d1d1f;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
+form{background:#fff;padding:28px 26px;border-radius:14px;box-shadow:0 6px 24px rgba(0,0,0,.08);
+display:flex;flex-direction:column;gap:12px;min-width:260px}
+h1{font-size:16px;margin:0}p{margin:0;font-size:13px;color:#6e6e73}
+input{padding:9px 11px;border:1px solid #d2d2d7;border-radius:9px;font-size:15px}
+button{padding:9px;border:0;border-radius:9px;background:#007aff;color:#fff;font-size:15px;
+cursor:pointer}</style></head><body><form method="get">
+<h1>白读 · ByRead</h1><p>这台服务设了访问口令，输入后才能进入。</p>
+<input type="password" name="token" autofocus autocomplete="current-password" placeholder="访问口令">
+<button type="submit">进入</button></form></body></html>"""
+
+
+def refresh_auth_token() -> str:
+    """
+    重新解析口令（启动时调一次，把设置表里的值也纳入进来；环境变量优先）。
+    返回当前口令，空串表示未启用鉴权。
+    """
+    global _AUTH_TOKEN
+    env = (os.environ.get("BYREAD_TOKEN") or "").strip()
+    _AUTH_TOKEN = env or (db.get_setting("access_token") or "").strip()
+    return _AUTH_TOKEN
+
+
+def _token_matches(given: str) -> bool:
+    """定时安全比较：不要用 == 比口令，否则理论上能被逐字符试探出来。"""
+    return bool(given) and secrets.compare_digest(given, _AUTH_TOKEN)
+
+
+def _url_without_token() -> str:
+    """当前地址去掉 token 参数（其他参数保留），用于登录后重定向。"""
+    args = [(k, v) for k, v in request.args.items() if k != "token"]
+    return request.path + (("?" + urlencode(args)) if args else "")
+
+
+@app.before_request
+def _auth_guard():
+    """
+    全局鉴权钩子。**没配口令时是纯 no-op**（直接放行），本地自用与以前完全一致。
+    配了口令则所有页面与接口都要口令。
+    """
+    if not _AUTH_TOKEN:
+        return None                      # ← 默认路径：什么都不做
+    path = request.path or ""
+    if path.startswith(AUTH_EXEMPT_PREFIXES):
+        return None
+    if _token_matches(request.cookies.get(AUTH_COOKIE, "")):
+        return None
+
+    given = (request.args.get("token") or "").strip()
+    from_header = False
+    if not given:
+        header = request.headers.get("Authorization") or ""
+        if header.lower().startswith("bearer "):
+            given = header[7:].strip()
+            from_header = True
+
+    if _token_matches(given):
+        if from_header:
+            return None                  # 程序化调用：每次带 header 即可，不种 Cookie
+        # 浏览器用 ?token=xxx 进来的：种 Cookie 并重定向掉 token，
+        # 免得口令留在地址栏、浏览历史和 Referer 里
+        resp = redirect(_url_without_token())
+        resp.set_cookie(AUTH_COOKIE, _AUTH_TOKEN, httponly=True, samesite="Lax",
+                        max_age=30 * 24 * 3600)
+        return resp
+
+    log.warning("拒绝未带口令的访问：%s %s（来自 %s）", request.method, path,
+                request.remote_addr)
+    if path.startswith("/api/"):
+        return jsonify({"ok": False, "error": "需要访问口令"}), 401
+    return Response(_LOGIN_PAGE, status=401, mimetype="text/html")
 
 # 首次启动时自动添加的示例源（都是实测可直接抓取的，不依赖任何第三方服务）
 SEED_FEEDS = [
@@ -1216,7 +1352,17 @@ def api_image_proxy():
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
     bootstrap()
+    HOST, PORT = _resolve_bind()
+    token = refresh_auth_token()
+    if token:
+        log.info("已启用访问口令（BYREAD_TOKEN / access_token）：所有页面与接口都要口令")
+        if len(token) < 12:
+            log.warning("访问口令只有 %d 个字符，太短了 —— 建议换成一串 16 位以上的随机字符",
+                        len(token))
+    if HOST not in ("127.0.0.1", "localhost"):
+        log.info("监听地址是 %s：局域网/公网可以访问，建议同时设置 BYREAD_TOKEN 访问口令", HOST)
     threading.Thread(target=_scheduler_loop, name="byread-scheduler", daemon=True).start()
-    log.info("白读已启动 → http://127.0.0.1:5000")
+    log.info("白读已启动 → http://%s:%d（按 Ctrl+C 停止）",
+             "127.0.0.1" if HOST in ("0.0.0.0", "::") else HOST, PORT)
     # 关闭 reloader：避免调度线程被重复启动
-    app.run(host="127.0.0.1", port=5000, debug=False, threaded=True)
+    app.run(host=HOST, port=PORT, debug=False, threaded=True)

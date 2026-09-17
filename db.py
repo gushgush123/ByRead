@@ -22,7 +22,7 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 log = logging.getLogger("byread.db")
 
@@ -31,12 +31,6 @@ INSTANCE_DIR = BASE_DIR / "instance"
 DB_PATH = INSTANCE_DIR / "bai_read.db"
 
 # 默认设置：首次启动写入 settings 表
-# 正文提取逻辑的版本号。**改动解析方式（比如新支持了某种图片写法、换了解析器）就 +1**，
-# 已入库的老文章会在下次刷新时自动按新逻辑重取一遍正文。
-# 用版本号而不是"看正文长度/有没有图"来判断，是因为后者既会漏（有正文但内容过时）
-# 又会反复触发（正文本来就没图的内容每次刷新都白跑一次请求）。
-CONTENT_VERSION = 2
-
 DEFAULT_SETTINGS: dict[str, str] = {
     "theme": "light",                       # light / dark
     "view_mode": "card",                    # card / list
@@ -46,10 +40,50 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "auto_refresh_minutes": "30",           # 0 = 关闭自动刷新
     "page_size": "30",
     "sidebar_open": "true",                 # 侧边栏展开 / 收起
+    # 监听地址（给将来的多端/托管留的口子）。环境变量 BYREAD_HOST / BYREAD_PORT 优先，
+    # 默认仍然只监听本机 127.0.0.1:5000 —— 局域网也访问不到，这是有意的安全默认
+    "bind_host": "127.0.0.1",
+    "bind_port": "5000",
+    # 访问口令：留空 = 不鉴权（默认，本地自用）。填了之后所有页面和接口都要口令，
+    # 也可以直接用环境变量 BYREAD_TOKEN 覆盖（详见 app.py 的鉴权钩子）
+    "access_token": "",
+    # 版本号（见下方 sync_versions）。这里只是把当前值写进设置表，方便查看与将来比对
+    "schema_version": "1",
+    "content_version": "2",
     # 登录信息（敏感，接口一律脱敏返回，只存本地）
     "zhihu_cookie": "",
     "weibo_cookie": "",
 }
+
+# --------------------------------------------------------------------------- #
+# 版本号与"重处理"入口
+#
+# 两个版本号各管一件事，改了什么就把对应的 +1：
+#   SCHEMA_VERSION  结构 / 语义：加表、加列、改字段含义
+#   CONTENT_VERSION 正文提取：换解析器、补图片、改清洗规则
+#
+# 光有版本号还不够，得让**已经入库的数据**跟上，所以配一个注册表：
+#   CONTENT_REPROCESS[版本号] = 函数(conn) -> 影响行数
+# 启动时 sync_versions() 会按 (库里记录的版本, 当前版本] 依次执行这些函数。
+# 没挂函数的版本走**默认动作**：把老文章的 content_v 清零，下次刷新按新逻辑重取 ——
+# 这正是 CONTENT_VERSION 一直以来的约定（见 get_content_state / zhihu.py / weibo.py），
+# 现在把它从"各处心照不宣的写法"变成了一处机制。
+#
+# 例：以后正文提取换了解析器
+#     1) CONTENT_VERSION = 3
+#     2) 需要精确控制就挂一个函数，只把受影响的文章标旧：
+#        CONTENT_REPROCESS[3] = lambda conn: conn.execute(
+#            "UPDATE articles SET content_v = 0 WHERE <条件>").rowcount
+#    不挂也行，默认动作是"全部标旧"，代价只是多跑一轮正文请求。
+#
+# 用版本号而不是"看正文长度 / 有没有图"来判断，是因为后者既会漏（有正文但内容过时）
+# 又会反复触发（正文本来就没图的内容每次刷新都白跑一次请求）。
+# --------------------------------------------------------------------------- #
+SCHEMA_VERSION = 1
+CONTENT_VERSION = 2
+
+SCHEMA_REPROCESS: dict[int, Callable[[sqlite3.Connection], int]] = {}
+CONTENT_REPROCESS: dict[int, Callable[[sqlite3.Connection], int]] = {}
 
 _init_lock = threading.Lock()
 
@@ -281,9 +315,95 @@ def init_db() -> None:
                     "UPDATE feeds SET icon = substr(icon, 1, instr(icon, '?') - 1) "
                     "WHERE icon LIKE '%sinaimg%?%'"
                 )
+            sync_versions()          # 4. 版本推进 / 重处理（没有变化时什么都不做）
             log.info("数据库就绪：%s", DB_PATH)
         except Exception as exc:  # noqa: BLE001
             log.error("数据库初始化失败：%s", exc)
+
+
+# --------------------------------------------------------------------------- #
+# 版本推进（统一的重处理入口）
+# --------------------------------------------------------------------------- #
+def _stored_version(conn, key: str) -> Optional[int]:
+    """读设置表里记录的版本号；没记录或不是数字都返回 None。"""
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    if row is None:
+        return None
+    raw = row["value"] if isinstance(row, sqlite3.Row) else row[0]
+    if raw in (None, ""):
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        log.warning("设置 %s 不是数字（%r），按未记录处理", key, raw)
+        return None
+
+
+def _write_version(conn, key: str, value: int) -> None:
+    conn.execute(
+        "INSERT INTO settings(key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, str(value)),
+    )
+
+
+def _mark_content_stale(conn, current: int) -> int:
+    """
+    默认的重处理动作：把"用旧版逻辑取的正文"标记为待重取。
+
+    content_v 清零后，本地源在下次刷新时会重新请求这几篇的正文
+    （判断逻辑在 zhihu.py / weibo.py 里：old_ver < db.CONTENT_VERSION 就算过时）。
+    """
+    cur = conn.execute(
+        "UPDATE articles SET content_v = 0 WHERE COALESCE(content_v, 0) < ?", (current,)
+    )
+    return cur.rowcount
+
+
+def sync_versions() -> dict:
+    """
+    统一的"版本推进"入口，init_db() 里调用一次。返回做了什么（供日志查看）。
+
+    规则：
+      - 库里没记录过版本 → **只写版本号，不重处理**。否则每个老库升级后
+        都会莫名其妙地全量重取一遍正文（实测很容易被当成"刷新坏了"）。
+      - 记录过、且落在一个需要重处理的版本区间 → 依次执行注册表里的函数；
+        没挂函数的版本走默认动作（见 _mark_content_stale）。
+    整个过程不会抛异常：版本推进失败也不该让程序起不来。
+    """
+    summary = {"schema": (None, SCHEMA_VERSION), "content": (None, CONTENT_VERSION),
+               "steps": []}
+    try:
+        with get_conn() as conn:
+            for key, current, registry, kind in (
+                ("schema_version", SCHEMA_VERSION, SCHEMA_REPROCESS, "schema"),
+                ("content_version", CONTENT_VERSION, CONTENT_REPROCESS, "content"),
+            ):
+                old = _stored_version(conn, key)
+                if old is None:
+                    _write_version(conn, key, current)
+                    continue
+                summary[kind] = (old, current)
+                if old >= current:
+                    continue
+                for version in range(old + 1, current + 1):
+                    step = registry.get(version)
+                    if step is not None:
+                        summary["steps"].append((kind, version,
+                                                 getattr(step, "__name__", "step"),
+                                                 step(conn)))
+                    elif kind == "content":
+                        summary["steps"].append((kind, version, "标记老正文待重取",
+                                                 _mark_content_stale(conn, current)))
+                    # 结构版本没挂函数 = 结构变更已经由 _ensure_columns / SCHEMA 处理完了
+                _write_version(conn, key, current)
+        if summary["steps"]:
+            log.info("版本推进：schema %s → %s，content %s → %s，执行 %s",
+                     summary["schema"][0], summary["schema"][1],
+                     summary["content"][0], summary["content"][1], summary["steps"])
+    except Exception as exc:  # noqa: BLE001
+        log.error("版本推进失败（不影响正常使用）：%s", exc)
+    return summary
 
 
 # --------------------------------------------------------------------------- #
