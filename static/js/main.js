@@ -36,6 +36,7 @@
     articles: [],
     selected: -1,
     loading: false,
+    loadSeq: 0,             // 加载序号：丢掉"过期响应"，避免快速切换时旧内容盖住新内容
     counts: { all: 0, unread: 0, starred: 0, feeds: 0 },
     pageSize: 30,
     viewMode: document.body.getAttribute('data-view-mode') || 'card',
@@ -300,6 +301,10 @@
   function selectView(view, folder) {
     state.view = view;
     state.folder = folder === undefined ? 'all' : folder;
+    // 点顶部的 全部 / 未读 / 星标 就是"回到全局"：必须把频道范围也一起清掉，
+    // 否则点了「全部」列表还是只有那个频道的文章（标题还写着"xx 频道 · 全部"）。
+    // 想只看"某频道的未读"，顺序反一下即可：先点未读、再点频道（点频道不会改 view）。
+    state.channelId = null;
     setSelectMode(false);
     updateViewTitle();
     renderNav();
@@ -814,7 +819,14 @@
      数据
      ======================================================================= */
   async function load(reset) {
-    if (state.loading) return;
+    // "加载更多"要防重复触发；但 reset（切频道 / 切视图 / 搜索 / 刷新后重载）**必须放行** ——
+    // 以前这里是不管三七二十一 `if (state.loading) return`，于是快速切频道时
+    // 后一次点击被直接丢掉，界面上就出现"A 频道高亮着、列表里是 B 的内容"（实测可稳定复现）。
+    if (!reset && state.loading) return;
+
+    // 每次加载发一个序号：切频道会有多个请求同时在飞，**晚回来的旧响应不能覆盖新状态**。
+    // 序号对不上就整段丢弃（连错误提示都不弹，那是上一个视图的问题）。
+    const seq = ++state.loadSeq;
     state.loading = true;
     if (reset) {
       state.cursor = null;
@@ -834,6 +846,7 @@
       }
       if (!reset && state.cursor) url += '&cursor=' + encodeURIComponent(state.cursor);
       const data = await api('GET', url);
+      if (seq !== state.loadSeq) return;          // 过期响应：丢掉
       state.articles = reset ? data.articles : state.articles.concat(data.articles);
       state.cursor = data.next_cursor;
       state.hasMore = !!data.has_more;
@@ -842,11 +855,12 @@
       renderNav();
       renderList();
     } catch (err) {
+      if (seq !== state.loadSeq) return;          // 过期请求的报错也不该弹出来
       ByRead.toast(err.message, 'error');
       listEl.innerHTML = '';
       renderEmpty();
     } finally {
-      state.loading = false;
+      if (seq === state.loadSeq) state.loading = false;   // 只有最新那次负责解锁
     }
   }
 

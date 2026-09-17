@@ -32,7 +32,12 @@ desktop.ini
 
 # 开发时的临时脚本与输出（我自己调试用的，不该进仓库）
 _*.py
+_*.js
 _*.txt
+
+# 前端回归测试的依赖（tests/frontend 里 npm install 出来的，不进仓库）
+node_modules/
+package-lock.json
 
 # 个人调研笔记 / 草稿：留在本地，不推到 GitHub
 # （这些是给自己看的资料，不属于项目代码）
