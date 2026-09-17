@@ -13,11 +13,13 @@ app.py —— 白读 · ByRead 主应用
 from __future__ import annotations
 
 import io
+import json
 import logging
 import re
 import threading
 import time
 import xml.etree.ElementTree as ET
+import zipfile
 from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlparse
@@ -27,6 +29,7 @@ from flask import Flask, Response, jsonify, render_template, request
 
 import db
 import cookies
+import exporter
 import feed_parser
 import net  # noqa: F401  统一网络初始化（让 Python 用系统证书库）
 import rsshub
@@ -40,7 +43,10 @@ logging.basicConfig(
 log = logging.getLogger("byread")
 
 app = Flask(__name__)
-app.config["JSON_AS_ASCII"] = False
+# 接口返回中文而不是 \uXXXX 转义。注意：Flask 2.3 起 config["JSON_AS_ASCII"] 已经失效
+# （这里原来那一行就是死配置），要用 app.json.ensure_ascii；前端两种都能解析，
+# 但 curl 看接口、看日志时人眼友好得多。
+app.json.ensure_ascii = False
 app.config["TEMPLATES_AUTO_RELOAD"] = True
 
 # 首次启动时自动添加的示例源（都是实测可直接抓取的，不依赖任何第三方服务）
@@ -1019,6 +1025,113 @@ def api_opml_import():
 def api_clear_articles():
     count = db.clear_articles()
     return jsonify({"ok": True, "count": count, "counts": _counts()})
+
+
+# --------------------------------------------------------------------------- #
+# 数据导出（自用保险）
+#
+# 红线：**导出里绝不能有登录信息**。做法有两层 ——
+#   1. db.EXPORT_TABLES 是显式白名单，settings 表（Cookie 就在里面）压根不在其中；
+#   2. 出口处再实检一次：拿 settings 里两个 Cookie 的真实值在产物里搜一遍，命中就拒绝导出。
+# 第 2 层是"不信任自己"的保险 —— 万一以后有人往白名单里加了带 Cookie 的表，这里会拦住。
+# --------------------------------------------------------------------------- #
+# 只有够长的值才拿来判定：Cookie 里还夹着 ariaDefaultTheme=default 这种通用词（7 字符），
+# 拿它搜产物必然误报 —— 实测正文里一张图叫 `..._default.png` 就撞上了。
+# 真正的登录凭证（z_c0 / SUB / SUBP / WBPSESS / SCF / _xsrf / _zap …）都在 24 字符以上。
+_MIN_SECRET_LEN = 16
+
+
+def _leaked_secret(text: str) -> Optional[str]:
+    """
+    产物里是否出现了登录信息。返回命中的说明，没命中返回 None。
+
+    先看整条 Cookie 串，再按 `;` 拆成 `name=value` 逐个 value 比对（只比长度 ≥16 的），
+    这样即使 Cookie 被换了顺序、加了空格也能查出来。
+    """
+    for key in ("zhihu_cookie", "weibo_cookie"):
+        raw = (db.get_setting(key) or "").strip()
+        if not raw:
+            continue
+        if raw in text:
+            return f"{key} 的完整内容"
+        for piece in re.split(r"[;\s]+", raw):
+            if "=" not in piece:
+                continue
+            name, value = piece.split("=", 1)
+            value = value.strip()
+            if len(value) >= _MIN_SECRET_LEN and value in text:
+                return f"{key} 里 {name.strip()} 的值"
+    return None
+
+
+def _export_blocked(what: str, leaked: str):
+    """检测到登录信息就不给下载（500 + 日志留痕），绝不"先给出去再说"。"""
+    log.error("【红线】导出被拦截：%s 里检测到 %s —— 导出白名单可能被改坏了", what, leaked)
+    return jsonify({
+        "ok": False,
+        "error": "导出被安全拦截：产物里检测到登录信息（已记录日志），已中止下载",
+    }), 500
+
+
+@app.get("/api/export/json")
+def api_export_json():
+    """
+    导出全部数据：订阅源 / 文章 / 已读星标 / 收藏夹 / 频道（含频道与订阅源的对应关系）。
+    **不含 settings**，所以不含任何登录信息。文件可以直接留着当备份。
+    """
+    payload = {
+        "format": "byread-backup",
+        "version": 1,
+        "app": "白读 · ByRead",
+        "exported_at": db.utc_now_iso(),
+        "note": "只包含数据表；登录信息（Cookie）不在其中，这是有意的设计。",
+        "tables": db.export_tables(),
+    }
+    body = json.dumps(payload, ensure_ascii=False, indent=1)
+    leaked = _leaked_secret(body)
+    if leaked:
+        return _export_blocked("JSON 导出", leaked)
+    stats = {name: len(rows) for name, rows in payload["tables"].items()}
+    log.info("导出 JSON：%s（%d 字节）", stats, len(body.encode("utf-8")))
+    return Response(
+        body,
+        mimetype="application/json",
+        headers={"Content-Disposition":
+                 f'attachment; filename="byread-data-{time.strftime("%Y%m%d-%H%M")}.json"'},
+    )
+
+
+@app.get("/api/export/markdown")
+def api_export_markdown():
+    """
+    导出全部文章为 Markdown 压缩包：每篇文章一个 .md
+    （标题 / 来源 / 作者 / 时间 / 原文链接 / 收藏夹 / 正文）。
+    软删除的文章不导出（那是用户自己删掉的）。
+    """
+    articles = db.get_articles_for_export()
+    blob = exporter.build_markdown_zip(articles)
+
+    # 压缩包里是 deflate 数据，不能只搜整包字节 —— 得逐篇解开来看
+    leaked = None
+    try:
+        with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+            for name in zf.namelist():
+                text = zf.read(name).decode("utf-8", "ignore")
+                leaked = _leaked_secret(text)
+                if leaked:
+                    break
+    except Exception as exc:  # noqa: BLE001
+        log.error("导出 zip 自检失败：%s", exc)
+    if leaked:
+        return _export_blocked("Markdown 导出", leaked)
+
+    log.info("导出 Markdown：%d 篇，%d 字节", len(articles), len(blob))
+    return Response(
+        blob,
+        mimetype="application/zip",
+        headers={"Content-Disposition":
+                 f'attachment; filename="byread-articles-{time.strftime("%Y%m%d-%H%M")}.zip"'},
+    )
 
 
 # --------------------------------------------------------------------------- #

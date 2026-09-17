@@ -190,6 +190,18 @@
     </div>
     <input type="file" id="opml-file" accept=".opml,.xml,text/xml,text/x-opml" style="display:none">
     <div class="field__hint">清空文章会保留订阅源；删除单个订阅源会连同它的文章一起删除。</div>
+
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:16px">
+      <a class="btn" href="/api/export/json">💾 导出全部数据（JSON）</a>
+      <a class="btn" href="/api/export/markdown">📦 导出全部文章（Markdown）</a>
+    </div>
+    <div class="field__hint">
+      <b>JSON</b>：订阅源 / 文章 / 已读星标 / 收藏夹 / 频道，一个文件装全，适合定期留一份当保险。<br>
+      <b>Markdown</b>：压缩包，每篇文章一个 .md（标题、来源、时间、原文链接、正文），
+      适合拿出去存档或换设备读。<br>
+      <b>两种导出都不含设置里的登录信息（Cookie）</b> —— 和"数据库不进 git"是同一条红线，
+      所以导出文件可以放心备份或分享。
+    </div>
   </section>
 
   <!-- ============ 高级：订阅服务实例 ============ -->

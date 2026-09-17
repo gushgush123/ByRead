@@ -1363,3 +1363,75 @@ def get_deleted_count() -> int:
     except Exception as exc:  # noqa: BLE001
         log.error("统计已删除文章失败：%s", exc)
         return 0
+
+
+# --------------------------------------------------------------------------- #
+# 数据导出（自用保险）
+#
+# **只导出数据表，绝不导出 settings** —— 登录信息（zhihu_cookie / weibo_cookie）
+# 只存在 settings 里。这和 .gitignore 排除 instance/ 是同一条红线：
+# 导出文件是要被复制、备份、甚至发给别人的，绝不能夹带 Cookie。
+#
+# 这里用**显式白名单**，而不是"遍历 sqlite_master 里所有表"：
+# 后者意味着以后新增任何一张表都会自动被导出，早晚有一天会把 settings 捎出去。
+# --------------------------------------------------------------------------- #
+EXPORT_TABLES = (
+    "feeds",           # 订阅源
+    "articles",        # 文章（含软删除的，备份要完整）
+    "user_actions",    # 已读 / 星标 / 收藏夹归属
+    "folders",         # 收藏夹
+    "channels",        # 频道
+    "channel_feeds",   # 频道 ↔ 订阅源（少了它，频道恢复出来是空的）
+)
+
+# 手滑把 settings 加进白名单的话，让程序在启动时就炸掉，
+# 而不是安静地把登录信息导出去（这种事必须"响"着失败）
+if "settings" in EXPORT_TABLES:  # pragma: no cover
+    raise RuntimeError("settings 表里有登录信息，绝不能进导出白名单")
+
+
+def export_tables(tables: Optional[Iterable[str]] = None) -> dict[str, list[dict]]:
+    """
+    把指定的数据表原样导出成 JSON 可序列化的字典：{表名: [行, ...]}。
+
+    表名只可能来自上面的白名单（不是用户输入），所以这里拼 SQL 没有注入问题；
+    任何一张表失败只影响它自己，不影响其它表，也不会抛异常。
+    """
+    wanted = list(tables if tables is not None else EXPORT_TABLES)
+    if "settings" in wanted:
+        log.error("拒绝导出：settings 表里有登录信息")
+        return {}
+    out: dict[str, list[dict]] = {}
+    try:
+        with get_conn() as conn:
+            for table in wanted:
+                try:
+                    out[table] = _rows(conn.execute(f"SELECT * FROM {table}"))
+                except Exception as exc:  # noqa: BLE001
+                    log.error("导出表 %s 失败：%s", table, exc)
+                    out[table] = []
+    except Exception as exc:  # noqa: BLE001
+        log.error("导出数据失败：%s", exc)
+    return out
+
+
+def get_articles_for_export() -> list[dict]:
+    """
+    取出用于「每篇一个 Markdown」的文章（不含软删除的），带上来源名与收藏夹名。
+    正文用 a.content（正文提取的结果），没有正文的走 summary。
+    """
+    try:
+        with get_conn() as conn:
+            return _rows(conn.execute(
+                "SELECT a.id, a.title, a.author, a.published, a.link, a.content, a.summary, "
+                "  a.audio_url, f.title AS feed_title, f.site_url AS feed_site_url, "
+                "  COALESCE(ua.is_starred, 0) AS is_starred, fl.name AS folder_name "
+                "FROM articles a JOIN feeds f ON f.id = a.feed_id "
+                "LEFT JOIN user_actions ua ON ua.article_id = a.id "
+                "LEFT JOIN folders fl ON fl.id = ua.folder_id "
+                "WHERE COALESCE(a.is_deleted, 0) = 0 "
+                "ORDER BY a.published DESC, a.id DESC"
+            ))
+    except Exception as exc:  # noqa: BLE001
+        log.error("读取导出用文章失败：%s", exc)
+        return []
