@@ -479,10 +479,15 @@
     }
   }
 
-  function saveSetting(key, value) {
-    return api('POST', '/api/settings', { [key]: value }).catch(function (err) {
+  // 保存设置。失败时不抛异常（很多地方是"点一下就存"、不接返回值），
+  // 但返回 null 让调用方知道没存上 —— 否则会出现"校验没过、却弹了已保存"
+  async function saveSetting(key, value) {
+    try {
+      return await api('POST', '/api/settings', { [key]: value });
+    } catch (err) {
       ByRead.toast(err.message, 'error');
-    });
+      return null;
+    }
   }
 
   document.getElementById('keywords-save').addEventListener('click', async function () {
@@ -522,10 +527,12 @@
   /* ---------------- 实例 ---------------- */
   document.getElementById('instance-save').addEventListener('click', async function () {
     const url = document.getElementById('instance-input').value.trim();
-    await saveSetting('rsshub_instance', url);
+    const res = await saveSetting('rsshub_instance', url);
+    if (!res) return;                       // 校验没过（原因已经弹出来了），别再说"已保存"
+    const tip = ((res.messages || {}).rsshub_instance || {}).message || '';
     ByRead.toast(url ? '已保存实例地址' : '已改为自动选择', 'ok');
     document.getElementById('instance-status').textContent = url
-      ? '当前手动指定：' + url
+      ? ('当前手动指定：' + url + (tip ? '｜' + tip : ''))
       : '已改为自动选择，下次需要时会自动探测。';
   });
 

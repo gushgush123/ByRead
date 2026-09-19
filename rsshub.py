@@ -344,7 +344,12 @@ class ResolverError(RuntimeError):
 # 实例管理
 # --------------------------------------------------------------------------- #
 def _instance_ok(base: str, timeout: int = TIMEOUT) -> bool:
-    """探测实例是否可用（拿一个最轻的固定路由试）。"""
+    """
+    探测实例是否可用：拿一个最轻的固定路由试，**并且要求它真的返回了一份订阅内容**。
+
+    只判断"HTTP < 400"是不够的：很多站点（SPA、带兜底路由的站）对任意路径都回 200，
+    于是把 https://sspai.com 填进去也会被判成"可用"，最后拼出来的地址当然取不到东西。
+    """
     if not base:
         return False
     try:
@@ -353,7 +358,11 @@ def _instance_ok(base: str, timeout: int = TIMEOUT) -> bool:
             timeout=timeout,
             headers={"User-Agent": "ByRead/0.1 (local RSS reader)"},
         )
-        return r.status_code < 400
+        if r.status_code >= 400:
+            return False
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        head = (r.content or b"")[:2000].lower()
+        return "xml" in ctype or b"<rss" in head or b"<feed" in head
     except Exception:  # noqa: BLE001
         return False
 
@@ -383,14 +392,55 @@ def probe_instances(include_configured: bool = True, timeout: int = TIMEOUT) -> 
     return results
 
 
+# 明显不是"实例根地址"的形状：订阅地址、opml 之类
+_FEEDISH_PATH_RE = re.compile(r"\.(xml|rss|atom|json|opml)$|/(rss|feed|feeds|atom)(/|$)",
+                              re.IGNORECASE)
+
+
+def validate_instance(url: str) -> tuple[bool, str]:
+    """
+    检查"手填的订阅服务实例"能不能用，返回 (是否可用, 给用户看的一句话)。
+
+    为什么必须有这道校验：这个字段以前是**原样存下来、原样使用**的。实测有人把订阅地址
+    （http://www.people.com.cn/rss/politics.xml）填进了这里 ——
+    于是 V2EX / 豆瓣 / 36氪 这三个"需要拼路由"的预置源全部订阅失败，
+    而错误信息只是一句"找不到"，完全看不出是设置填错了。
+    所以：先按形状挡一道（订阅地址一眼能认出来），再真的拿一个最轻的路由探一下。
+    """
+    value = (url or "").strip().rstrip("/")
+    if not value:
+        return True, "留空 = 每次自动探测一个可用实例"
+
+    parsed = urlparse(value)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return False, "要填 http:// 或 https:// 开头的地址"
+    if _FEEDISH_PATH_RE.search(parsed.path or ""):
+        return False, ("这看起来是一个「订阅地址」（以 .xml / .rss / /feed 之类结尾）。"
+                       "这里要填的是「订阅服务实例」的根地址，例如 https://rsshub.app；"
+                       "想订阅这个地址，请回首页点「＋ 添加」再粘贴它。")
+    if not _instance_ok(value):
+        # 探测不通**不算填错**：公共实例本来就时好时坏。
+        # 真正的保险在 resolve_instance()：用它之前会再确认一次，不通就自动换一个，
+        # 所以这里只提醒，不拦着保存（拦了会让人以为"这个实例不能用"而白折腾）。
+        return True, ("提醒：刚才没能从这个实例取到内容（公共实例经常时好时坏）。"
+                      "用的时候会再确认一次，不通就自动换一个。")
+    return True, "实例可用，已保存"
+
+
 def resolve_instance(force: bool = False) -> Optional[str]:
     """
     取一个可用的实例地址。
-    优先级：设置里手填的 → 上次自动探测成功的 → 按候选顺序现场探测。
+    优先级：设置里手填的（**要先确认它真的能用**）→ 上次自动探测成功的 → 按候选顺序现场探测。
+
+    注意手填值也要探一下：以前是无条件信任的，于是填错一个地址就会让所有"需要拼路由"的源
+    静默失效（实测踩过）。宁可慢一点，也不要拿着一个坏地址去拼 URL。
     """
     configured = (db.get_setting("rsshub_instance") or "").strip().rstrip("/")
-    if configured and not force:
-        return configured
+    if configured:
+        if not force and _instance_ok(configured):
+            return configured
+        log.warning("手填的订阅服务实例不可用（%s），本次改用自动探测 —— "
+                    "去设置页 →「高级」检查一下这个地址，或清空它", configured)
 
     cached = (db.get_setting("rsshub_instance_auto") or "").strip().rstrip("/")
     if cached and not force and _instance_ok(cached):

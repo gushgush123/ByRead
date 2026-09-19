@@ -1078,6 +1078,18 @@ def api_set_settings():
             import json
 
             value = json.dumps(value, ensure_ascii=False)
+        if key == "rsshub_instance":
+            # 这个字段填错了会让所有"需要拼路由"的源静默失效（实测有人把订阅地址填在了这里），
+            # 所以保存前先校验：明显填错（比如填成订阅地址）直接 400 退回，
+            # 前端会弹出原因、并且不会再显示"已保存"。
+            # 探测不通不拦（公共实例本来就时好时坏），只把提醒带回前端；
+            # 真正的保险是 resolve_instance()：用它之前会再确认一次，不通就自动换。
+            ok, message = rsshub.validate_instance(str(value or ""))
+            if not ok:
+                log.info("拒绝保存 rsshub_instance=%r：%s", value, message)
+                return jsonify({"ok": False, "error": message, "field": key}), 400
+            value = str(value or "").strip()
+            messages[key] = {"ok": True, "message": message}
         db.set_setting(key, value)
         updated[key] = value
     return jsonify(
