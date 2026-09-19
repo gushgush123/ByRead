@@ -584,6 +584,32 @@ def _read_capped(resp, max_bytes: int) -> tuple[bytes, bool]:
     return b"".join(chunks), False
 
 
+_CHARSET_DECL_RE = re.compile(rb"""encoding\s*=\s*["']([\w.:-]+)["']""", re.IGNORECASE)
+
+
+def _decode_by_declaration(raw: bytes):
+    """
+    截断读取时，先按文档自己声明的编码解成字符串再交给 feedparser。
+
+    为什么必须这么做：feedparser 在**残缺**文档上会放弃 XML 声明、改用猜测的编码。
+    实测人民网的源（声明 UTF-8、标题写在 CDATA 里）截成 256KB 后，
+    feed.title 变成按 iso-8859-2 解出来的乱码（"时政频道" → "æ—¶æ”¿é¢‘é“…"），
+    于是"粘贴地址订阅"会把乱码当源名写进库 —— 而且它看着不像占位符，之后再也不会自愈。
+    完整文档没有这个问题，所以只在这条（截断）路径上动手，其余情况一律交给 feedparser。
+    """
+    if not raw:
+        return raw
+    match = _CHARSET_DECL_RE.search(raw[:2048])
+    if not match:
+        return raw
+    encoding = match.group(1).decode("ascii", "ignore").strip()
+    try:
+        return raw.decode(encoding, "replace")
+    except (LookupError, UnicodeError) as exc:
+        log.info("按声明编码 %s 解码失败，交回 feedparser 判断：%s", encoding, exc)
+        return raw
+
+
 def fetch_feed(feed_url: str, timeout: int = TIMEOUT, limit: int = 20,
                content_state: Optional[dict] = None,
                max_bytes: Optional[int] = None) -> dict:
@@ -615,6 +641,9 @@ def fetch_feed(feed_url: str, timeout: int = TIMEOUT, limit: int = 20,
         resp.close()
     if not raw:
         raise RuntimeError("返回内容为空")
+    if truncated:
+        # 截断的文档要自己按声明编码解码，否则 feedparser 会瞎猜编码（标题会变乱码）
+        raw = _decode_by_declaration(raw)
 
     parsed = feedparser.parse(raw)
     entries = parsed.get("entries") or []
@@ -626,7 +655,7 @@ def fetch_feed(feed_url: str, timeout: int = TIMEOUT, limit: int = 20,
             full = _requests.get(feed_url, timeout=timeout, allow_redirects=True)
             if full.status_code >= 400:
                 raise RuntimeError(f"HTTP {full.status_code}")
-            raw = full.content
+            raw = full.content          # 整份就是完整的，不用再按声明解码
             parsed = feedparser.parse(raw)
             entries = parsed.get("entries") or []
         if not entries and parsed.get("bozo"):
