@@ -579,6 +579,205 @@
     }
   });
 
+  /* ---------------- AI 实验室（测试版） ---------------- */
+  // 这里只做两件事：把模型状态/理解结果摊开给用户看，以及把用户的评价写进本机 JSONL。
+  // 刻意**不**在这里做"直接订阅"——能不能订由搜索链和两道闸门决定（见 ai.py 文件头）。
+  const aiStatusEl = document.getElementById('ai-status');
+  const aiToggleBtn = document.getElementById('ai-toggle');
+  const aiResultEl = document.getElementById('ai-result');
+  let aiEnabled = true;
+  let aiLast = null;              // 最近一次理解结果，反馈时一起带上
+
+  function renderAiStatus(st) {
+    if (!aiStatusEl) return;
+    aiEnabled = st.enabled !== false;
+    aiToggleBtn.textContent = aiEnabled ? '关闭 AI 功能' : '打开 AI 功能';
+    const dot = st.available && st.model_present ? '●' : '○';
+    const parts = [dot + ' ' + (st.detail || '')];
+    if (st.model) parts.push('模型：' + st.model);
+    if (st.base_url) parts.push('地址：' + st.base_url);
+    if (st.warmed) parts.push('已加载（' + (st.warm_ms || 0) + 'ms）');
+    else if (st.warming) parts.push('正在加载…');
+    if (st.timeout_seconds) parts.push('单次上限 ' + st.timeout_seconds + ' 秒');
+    aiStatusEl.textContent = parts.join('　|　');
+  }
+
+  async function loadAiStatus(warm) {
+    if (!aiStatusEl) return;
+    try {
+      const st = await api('GET', '/api/ai/status' + (warm ? '?warm=1' : ''));
+      renderAiStatus(st);
+    } catch (err) {
+      aiStatusEl.textContent = '状态读取失败：' + err.message;
+    }
+  }
+
+  if (aiStatusEl) {
+    loadAiStatus(false);
+    document.getElementById('ai-check').addEventListener('click', async function () {
+      const btn = this;
+      btn.disabled = true;
+      btn.textContent = '检测中（首次加载模型要 5~11 秒）';
+      try {
+        await loadAiStatus(true);
+        ByRead.toast('检测完成', 'ok');
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '检测 / 预热';
+      }
+    });
+
+    aiToggleBtn.addEventListener('click', async function () {
+      const next = aiEnabled ? 'false' : 'true';
+      const res = await saveSetting('ai_enabled', next);
+      if (!res) return;
+      aiEnabled = next === 'true';
+      ByRead.toast(aiEnabled ? '已打开 AI 功能' : '已关闭 AI 功能', 'ok');
+      await loadAiStatus(false);
+    });
+
+    document.getElementById('ai-feedback-export').addEventListener('click', function () {
+      window.location = '/api/ai/feedback/export';
+    });
+
+    document.getElementById('ai-feedback-copy').addEventListener('click', async function () {
+      try {
+        const res = await fetch('/api/ai/feedback/export');
+        const text = await res.text();
+        if (!text.trim()) {
+          ByRead.toast('还没有反馈可复制', 'error');
+          return;
+        }
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(text);
+          ByRead.toast('已复制 ' + text.trim().split('\n').length + ' 条反馈', 'ok');
+        } else if (confirm('这个浏览器不让直接写剪贴板。要把反馈内容显示出来自己复制吗？')) {
+          window.prompt('复制下面这段发给我：', text);
+        }
+      } catch (err) {
+        ByRead.toast('复制失败：' + err.message, 'error');
+      }
+    });
+
+    renderAiTry();
+  }
+
+  function aiRow(label, value) {
+    const row = document.createElement('div');
+    row.className = 'ai-lab__row';
+    const k = document.createElement('span');
+    k.className = 'ai-lab__key';
+    k.textContent = label;
+    const v = document.createElement('span');
+    v.className = 'ai-lab__val';
+    v.textContent = value || '（空）';
+    row.appendChild(k);
+    row.appendChild(v);
+    return row;
+  }
+
+  /** 点「让它理解」→ 展示 AI 的理解 + 模型原话 + 收集反馈 */
+  function renderAiTry() {
+    const input = document.getElementById('ai-query');
+    const btn = document.getElementById('ai-try');
+    if (!input || !btn) return;
+    btn.addEventListener('click', async function () {
+      const q = input.value.trim();
+      if (!q) { ByRead.toast('先写一句试试', 'error'); return; }
+      btn.disabled = true;
+      btn.textContent = '理解中…';
+      aiResultEl.style.display = 'block';
+      aiResultEl.innerHTML = '<div class="ai-lab__row"><span class="ai-lab__key">状态</span>'
+        + '<span class="ai-lab__val">本地模型正在读这句话…（第一次可能要十几秒）</span></div>';
+      try {
+        const data = await api('POST', '/api/ai/interpret', { q: q });
+        aiLast = Object.assign({ query: q }, data);
+        aiResultEl.innerHTML = '';
+        if (!data.ok) {
+          aiResultEl.appendChild(aiRow('结果', '没读懂：' + (data.error || '未知原因')));
+        } else {
+          aiResultEl.appendChild(aiRow('平台', data.platform_label || '（没判断出来）'));
+          aiResultEl.appendChild(aiRow('名字', data.keyword));
+          aiResultEl.appendChild(aiRow('建议查询词', data.query_suggest));
+          aiResultEl.appendChild(aiRow('把握', (Math.round((data.confidence || 0) * 100)) + '%'));
+          aiResultEl.appendChild(aiRow('理由', data.reason));
+        }
+        aiResultEl.appendChild(aiRow('用时', (data.elapsed_ms || 0) + ' ms'));
+
+        const raw = document.createElement('details');
+        raw.className = 'ai-lab__raw';
+        const sum = document.createElement('summary');
+        sum.textContent = '看模型的原话';
+        const pre = document.createElement('pre');
+        pre.textContent = data.raw || '(空)';
+        raw.appendChild(sum);
+        raw.appendChild(pre);
+        aiResultEl.appendChild(raw);
+
+        // 反馈：赞 / 踩 + 正确答案 —— 这是"让用户参与测试"的落点
+        const fb = document.createElement('div');
+        fb.className = 'ai-lab__fb';
+        const up = document.createElement('button');
+        up.className = 'btn btn--sm';
+        up.id = 'ai-fb-up';
+        up.textContent = '👍 理解对了';
+        const correct = document.createElement('input');
+        correct.className = 'input';
+        correct.id = 'ai-fb-correct';
+        correct.placeholder = '理解错了？把正确答案写这儿（可留空）';
+        const down = document.createElement('button');
+        down.className = 'btn btn--sm';
+        down.id = 'ai-fb-down';
+        down.textContent = '👎 理解错了';
+        fb.appendChild(up);
+        fb.appendChild(down);
+        fb.appendChild(correct);
+        aiResultEl.appendChild(fb);
+
+        async function sendFeedback(verdict) {
+          try {
+            const res = await api('POST', '/api/ai/feedback', {
+              verdict: verdict,
+              correct: correct.value.trim(),
+              query: aiLast.query,
+              platform: aiLast.platform || '',
+              keyword: aiLast.keyword || '',
+              rewritten: aiLast.query_suggest || '',
+              reason: aiLast.reason || '',
+              confidence: aiLast.confidence || 0,
+              raw: aiLast.raw || '',
+              elapsed_ms: aiLast.elapsed_ms || 0,
+            });
+            ByRead.toast('已记录（本机第 ' + res.count + ' 条）', 'ok');
+            loadAiFeedbackCount();
+          } catch (err) {
+            ByRead.toast('记录失败：' + err.message, 'error');
+          }
+        }
+        up.addEventListener('click', function () { sendFeedback('up'); });
+        down.addEventListener('click', function () { sendFeedback('down'); });
+      } catch (err) {
+        aiResultEl.innerHTML = '';
+        aiResultEl.appendChild(aiRow('失败', err.message));
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '让它理解';
+      }
+    });
+  }
+
+  async function loadAiFeedbackCount() {
+    const el = document.getElementById('ai-feedback-count');
+    if (!el) return;
+    try {
+      const data = await api('GET', '/api/ai/feedback');
+      el.textContent = data.count ? '（本机已有 ' + data.count + ' 条反馈）' : '（本机还没有反馈）';
+    } catch (err) {
+      el.textContent = '';
+    }
+  }
+  loadAiFeedbackCount();
+
   /* ---------------- 数据管理 ---------------- */
   document.getElementById('opml-import-btn').addEventListener('click', function () {
     document.getElementById('opml-file').click();

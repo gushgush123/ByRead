@@ -204,6 +204,47 @@
     </div>
   </section>
 
+  <!-- ============ AI 实验室（测试版） ============ -->
+  <section class="section">
+    <h2 class="section__title">✨ AI 实验室（测试版）</h2>
+    <div class="panel">
+      <div class="field">
+        <label class="field__label">本地小模型（Ollama）</label>
+        <div class="ai-lab__actions">
+          <button class="btn btn--sm" id="ai-check">检测 / 预热</button>
+          <button class="btn btn--sm" id="ai-toggle">…</button>
+          <button class="btn btn--sm" id="ai-feedback-export">⬇ 导出反馈</button>
+          <button class="btn btn--sm" id="ai-feedback-copy">📋 复制反馈</button>
+        </div>
+        <div class="field__hint" id="ai-status">读取中…</div>
+      </div>
+
+      <div class="field">
+        <label class="field__label" for="ai-query">试一句（用你自己的说法，不用管格式）</label>
+        <div class="input-group">
+          <input class="input" id="ai-query" type="text" autocomplete="off"
+                 placeholder="例如：帮我订阅半佛仙人 / 我想追那个讲财经的B站up">
+          <button class="btn btn--primary" id="ai-try">让它理解</button>
+        </div>
+        <div class="field__hint" id="ai-result-hint">
+          这里只做"理解"这一步：把模型解析出的平台/名字/理由和它的原话摊开给你看，不会直接订任何东西。
+        </div>
+        <div id="ai-result" style="display:none"></div>
+      </div>
+
+      <div class="field__hint">
+        <b>这是什么</b>：模型跑在你自己电脑上（默认 <span class="mono">127.0.0.1:11434</span>），不联网、不需要
+        API key，你输入的内容不会离开本机。<br>
+        <b>它怎么被使用</b>：搜索一个确定结果都没有时（尤其是你说的是一整句话的时候），它会把这句"人话"
+        翻译成「平台 + 名字」。它猜出来的候选一律标「不确定」并且默认收起，需要你点开确认 ——
+        最终能不能订，仍然由搜索链和两道闸门决定。<br>
+        <b>你的反馈去哪</b>：只写在本机 <span class="mono">instance/ai_feedback.jsonl</span>，一行一条，
+        不会自动上传。想把真实用例给我，就点「复制反馈」把内容贴过来。
+        <span id="ai-feedback-count"></span>
+      </div>
+    </div>
+  </section>
+
   <!-- ============ 高级：订阅服务实例 ============ -->
   <section class="section">
     <h2 class="section__title">高级</h2>

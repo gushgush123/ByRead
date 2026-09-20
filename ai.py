@@ -433,3 +433,76 @@ def suggest(query: str, limit: int = 3) -> dict:
                    f"下面是它猜的 {len(cands)} 个候选（不确定，默认收起）")
     out["elapsed_ms"] = int((time.time() - started) * 1000)
     return out
+
+
+# --------------------------------------------------------------------------- #
+# 反馈（测试期用）：只写本机 instance/ai_feedback.jsonl，一行一条，不自动上传
+#
+# 为什么不用数据库表：这一阶段只是"收集真实用例"，JSONL 一行一条最省事 ——
+# 不用动 schema、不写迁移、可以直接 grep，也能整份贴给开发者。
+# --------------------------------------------------------------------------- #
+def feedback_path():
+    import db
+
+    return db.INSTANCE_DIR / "ai_feedback.jsonl"
+
+
+def feedback_count() -> int:
+    try:
+        path = feedback_path()
+        if not path.exists():
+            return 0
+        with path.open("r", encoding="utf-8") as fh:
+            return sum(1 for line in fh if line.strip())
+    except Exception as exc:  # noqa: BLE001
+        log.info("读 AI 反馈条数失败：%s", exc)
+        return 0
+
+
+def feedback_text() -> str:
+    try:
+        path = feedback_path()
+        return path.read_text(encoding="utf-8") if path.exists() else ""
+    except Exception as exc:  # noqa: BLE001
+        log.info("读 AI 反馈失败：%s", exc)
+        return ""
+
+
+def save_feedback(payload: dict) -> dict:
+    """
+    记一条"用户对 AI 这次理解"的评价。字段尽量记全，方便事后判断是提示词问题还是模型问题：
+        verdict    up（理解对了）/ down（理解错了）
+        query      用户原话
+        correct    用户填的正确答案（可以空）
+        platform/keyword/rewritten/confidence/reason/raw   模型这次说了什么
+    任何异常都不上抛（本项目的通用红线）。
+    """
+    payload = payload or {}
+    try:
+        path = feedback_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        verdict = _clean_str(payload.get("verdict"), 8).lower()
+        if verdict not in ("up", "down"):
+            verdict = "down" if payload.get("correct") else "up"
+        record = {
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "verdict": verdict,
+            "query": _clean_str(payload.get("query"), 200),
+            "correct": _clean_str(payload.get("correct"), 80),
+            "platform": _clean_str(payload.get("platform"), 32),
+            "keyword": _clean_str(payload.get("keyword"), 80),
+            "rewritten": _clean_str(payload.get("rewritten"), 80),
+            "reason": _clean_str(payload.get("reason"), 80),
+            "confidence": payload.get("confidence", 0),
+            "raw": _clean_str(payload.get("raw"), 500),
+            "elapsed_ms": payload.get("elapsed_ms", 0),
+            "model": model(),
+        }
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        log.info("收到一条 AI 反馈：%s %r", record["verdict"], record["query"][:30])
+        return {"ok": True, "count": feedback_count()}
+    except Exception as exc:  # noqa: BLE001
+        log.info("写 AI 反馈失败：%s", exc)
+        return {"ok": False, "count": feedback_count(),
+                "error": f"写反馈失败：{type(exc).__name__}"}

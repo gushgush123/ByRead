@@ -234,6 +234,51 @@ def run_offline() -> tuple[bool, list[str]]:
         ai._chat, ai._get = real_chat, real_get  # noqa: SLF001
 
     lines.append("")
+    lines.append("feedback()（反馈只写本机文件；这里写到临时目录，绝不碰真实数据）")
+    import json as _json
+    import tempfile
+
+    real_path = ai.feedback_path
+    with tempfile.TemporaryDirectory() as tmp:
+        target = Path(tmp) / "ai_feedback.jsonl"
+        ai.feedback_path = lambda: target
+        try:
+            res = ai.save_feedback({"verdict": "down", "query": "我想追那个讲财经的B站up",
+                                    "correct": "半佛仙人", "platform": "bilibili",
+                                    "keyword": "", "rewritten": "", "raw": "{...}"})
+            ok = res.get("ok") and res.get("count") == 1 and target.exists()
+            lines.append(f"  {'✅' if ok else '❌'} 写一条 → ok={res.get('ok')} "
+                         f"count={res.get('count')}")
+            if not ok:
+                fails.append("反馈没写成功")
+            rec = _json.loads(target.read_text(encoding="utf-8").strip().splitlines()[0])
+            ok = (rec["verdict"] == "down" and rec["query"] == "我想追那个讲财经的B站up"
+                  and rec["correct"] == "半佛仙人" and rec["platform"] == "bilibili"
+                  and rec["model"] == ai.model() and rec.get("ts"))
+            lines.append(f"  {'✅' if ok else '❌'} 落盘字段完整（含时间戳与模型名）")
+            if not ok:
+                fails.append("反馈字段不对")
+
+            ai.save_feedback({"query": "半佛仙人"})                   # 没给 verdict、也没正确答案
+            ai.save_feedback({"query": "半佛仙人", "correct": "别的"})  # 给了正确答案 → 当"理解错了"
+            text = ai.feedback_text()
+            verdicts = [_json.loads(x)["verdict"] for x in text.strip().splitlines()]
+            ok = verdicts == ["down", "up", "down"] and ai.feedback_count() == 3
+            lines.append(f"  {'✅' if ok else '❌'} verdict 推断 + 计数：{verdicts}"
+                         f"（count={ai.feedback_count()}）")
+            if not ok:
+                fails.append("verdict 推断或计数不对")
+
+            ai.feedback_path = lambda: Path(tmp) / "no" / "deep" / "x.jsonl"
+            res = ai.save_feedback({"query": "x"})
+            lines.append(f"  {'✅' if res.get('ok') else '❌'} 目录不存在时自动建目录 → "
+                         f"ok={res.get('ok')}")
+            if not res.get("ok"):
+                fails.append("反馈写入不会自动建目录")
+        finally:
+            ai.feedback_path = real_path
+
+    lines.append("")
     if fails:
         lines.append(f"❌ 未通过 {len(fails)} 项：")
         for f in fails:

@@ -678,6 +678,25 @@ button { font-family: inherit; cursor: pointer; }
 .ai-fallback__btn:hover { background: var(--accent); border-color: var(--accent); color: #fff; }
 .icon-btn--ai { color: var(--accent); font-weight: 600; }
 
+/* ---------- 设置页「AI 实验室（测试版）」 ---------- */
+.ai-lab__actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.ai-lab__row {
+  display: flex; gap: 10px; align-items: baseline;
+  padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 13.5px;
+}
+.ai-lab__row:last-of-type { border-bottom: none; }
+.ai-lab__key { color: var(--text-muted); min-width: 78px; flex-shrink: 0; }
+.ai-lab__val { color: var(--text); line-height: 1.7; word-break: break-word; }
+.ai-lab__raw { margin-top: 8px; }
+.ai-lab__raw summary { cursor: pointer; font-size: 13px; color: var(--text-secondary); }
+.ai-lab__raw pre {
+  margin: 8px 0 0; padding: 10px 12px; border-radius: var(--radius-sm);
+  background: var(--bg-input); color: var(--text-secondary);
+  font-size: 12.5px; line-height: 1.6; white-space: pre-wrap; word-break: break-word;
+}
+.ai-lab__fb { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; align-items: center; }
+.ai-lab__fb .input { flex: 1; min-width: 220px; }
+
 /* ---------- Toast ---------- */
 .toast-host {
   position: fixed;

@@ -1029,6 +1029,37 @@ def api_ai_interpret():
         return jsonify({"ok": False, "error": f"AI 调用失败：{type(exc).__name__}"})
 
 
+# --------------------------------------------------------------------------- #
+# AI 反馈（测试期）：只写本机 instance/ai_feedback.jsonl，不自动上传
+# --------------------------------------------------------------------------- #
+@app.post("/api/ai/feedback")
+def api_ai_feedback():
+    payload = request.get_json(silent=True) or {}
+    res = ai.save_feedback(payload)
+    return jsonify(res), (200 if res.get("ok") else 500)
+
+
+@app.get("/api/ai/feedback")
+def api_ai_feedback_info():
+    try:
+        return jsonify({"count": ai.feedback_count(), "path": str(ai.feedback_path())})
+    except Exception as exc:  # noqa: BLE001
+        log.info("查 AI 反馈失败：%s", exc)
+        return jsonify({"count": 0, "path": ""})
+
+
+@app.get("/api/ai/feedback/export")
+def api_ai_feedback_export():
+    """把反馈导成一个 JSONL 文件（一行一条）—— 测试期用户直接把这段贴给开发者。"""
+    try:
+        text = ai.feedback_text()
+    except Exception as exc:  # noqa: BLE001
+        log.info("导出 AI 反馈失败：%s", exc)
+        text = ""
+    return Response(text, mimetype="application/x-ndjson",
+                    headers={"Content-Disposition": "attachment; filename=ai_feedback.jsonl"})
+
+
 def _add_feed_from_url(url: str) -> tuple[Optional[dict], Optional[str]]:
     """
     粘贴链接添加。优先级：
