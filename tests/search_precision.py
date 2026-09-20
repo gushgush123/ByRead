@@ -38,6 +38,7 @@ import rsshub
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import search_gates  # noqa: E402  第一层：确定性门槛
+import ai_interpret  # noqa: E402  第一层：本地 AI 助手的确定性测试（同样零网络）
 
 # ---------------------------------------------------------------- 固定样本集（42 条，与阶段 0 报告一致）
 SAMPLES: list[tuple[str, str]] = (
@@ -118,7 +119,15 @@ UNSUPPORTED_LINK = "https://www.bilibili.com/video/BV1gfGw6RE5p"
 # 只有"平台按名字搜出来"的候选才在可疑观察器的作用域内
 PLATFORM_SEARCHES = {"B站", "知乎", "微博"}
 
-LAYERS = ("L0/L1 原生", "L2 预置源", "L3 URL识别", "失败")
+LAYERS = ("L0/L1 原生", "L2 预置源", "L3 URL识别", "仅 loose 候选", "失败")
+# 「仅 loose 候选」= 只有 loose（不确定）候选，没有一个是两道闸门判过的。
+# 这一桶**不算命中**：AI 猜的、以及"只是提到了平台"的候选都在这里，
+# 把它们算进命中会让"净命中"这个观察值被 AI 的猜测污染。
+
+# 判定/记录口径（P0 之后的 AI 改动带来的语义变化，写在这里免得以后被误读）：
+#   「候选数」= **确定候选**（match != "loose"）。loose 候选一律单独计数并打印出来，
+#   因为前端默认折叠它们、用户不点开就看不见 —— 这正是 AI 候选被允许存在的前提。
+VISIBLE = lambda c: c.get("match") != "loose"          # noqa: E731  确定候选（用户直接可见）
 
 
 def classify(query: str, result: dict) -> str:
@@ -126,12 +135,14 @@ def classify(query: str, result: dict) -> str:
     cands = result.get("candidates") or []
     if not cands:
         return "失败"
+    if all(c.get("match") == "loose" for c in cands):
+        return "仅 loose 候选"          # 前端默认折叠：用户第一眼看不到任何东西
     if rsshub.is_url(query):
         first = cands[0]
         if (first.get("feed_url") or "").startswith("byread://"):
             return "L0/L1 原生"
         return "L3 URL识别"
-    plats = {c.get("platform") for c in cands}
+    plats = {c.get("platform") for c in cands if c.get("match") != "loose"}
     native = {"B站", "知乎", "微博", "机核", "GitHub"}
     if plats & native and plats - native:
         return "L0/L1+L2"
@@ -200,6 +211,7 @@ def run_one(query: str) -> dict:
     cands = res.get("candidates") or []
     labels = [c.get("label") or "" for c in cands]
     loose = [c for c in cands if c.get("match") == "loose"]
+    visible = [c for c in cands if VISIBLE(c)]
     keyword = split_keyword(query)
     suspicious = []
     for c in cands:
@@ -207,23 +219,24 @@ def run_one(query: str) -> dict:
         if why:
             suspicious.append((c.get("title") or c.get("label"), why))
     return {"query": query, "layer": classify(query, res), "cost": cost,
-            "labels": labels, "loose": loose, "hint": res.get("hint"),
-            "n": len(labels), "keyword": keyword, "suspicious": suspicious}
+            "labels": labels, "loose": loose, "visible": visible, "hint": res.get("hint"),
+            "n": len(visible), "keyword": keyword, "suspicious": suspicious}
 
 
 def one_pass(detail: bool) -> list[dict]:
     rows = []
     if detail:
-        print(f"{'层':<14}{'用时':>7}  {'输入':<44}{'候选'}")
+        print(f"{'层':<14}{'用时':>7}  {'输入':<44}{'确定候选'}")
         print("-" * 104)
     for query, group in SAMPLES:
         r = run_one(query)
         r["group"] = group
         rows.append(r)
         if detail:
-            mark = "❌" if r["layer"] == "失败" else "  "
+            mark = "❌" if r["layer"] in ("失败", "仅 loose 候选") else "  "
+            extra = f"（另有 loose {len(r['loose'])} 个）" if r["loose"] else ""
             print(f"{mark}{r['layer']:<12}{r['cost']:>6.1f}s  {query[:42]:<44}{r['n']} 个 "
-                  f"{('| ' + ' / '.join(r['labels'][:2]))[:60] if r['n'] else ''}")
+                  f"{('| ' + ' / '.join(r['labels'][:2]))[:52] if r['n'] else ''}{extra}")
     return rows
 
 
@@ -231,7 +244,9 @@ def layer_stats(rows: list[dict]) -> tuple[dict[str, int], int]:
     stats: dict[str, int] = {}
     for r in rows:
         stats[r["layer"]] = stats.get(r["layer"], 0) + 1
-    hit = sum(v for k, v in stats.items() if k != "失败")
+    # 「失败」和「仅 loose 候选」都不算命中 —— 后者是 AI 猜的 / 只是提到平台的，
+    # 前端默认折叠，用户第一眼看不到，算成命中会污染这个观察值。
+    hit = sum(v for k, v in stats.items() if k not in ("失败", "仅 loose 候选"))
     return stats, hit
 
 
@@ -245,10 +260,15 @@ def check_incidents(rows: list[dict]) -> tuple[list[str], list[str]]:
             fails.append(f"事故样本缺失：{inc['query']}")
             continue
         tag = "上游依赖" if inc["upstream"] else "确定性"
-        labels, loose, hint = r["labels"], r["loose"], r["hint"]
+        labels, visible, loose, hint = r["labels"], r["visible"], r["loose"], r["hint"]
         if inc["expect"] == "no_candidate":
-            ok = not labels
-            verdict = "干净失败（无候选）" if ok else f"给了候选（{labels[0][:24]}）"
+            # 「无候选」= 没有**确定候选**（用户直接可见的那种）。
+            # AI 的 loose 候选（前端默认折叠、点开才可见）不计入 —— 见文件头的口径说明。
+            ok = not visible
+            verdict = ("干净失败（无确定候选）" if ok
+                       else f"给了确定候选（{visible[0].get('label', '')[:24]}）")
+            if loose:
+                verdict += f"，另有 loose {len(loose)} 个（折叠，不计入）"
         elif inc["expect"] == "loose_only":
             marked = bool(labels) and all(c.get("match") == "loose" for c in loose) \
                 and len(loose) == len(labels) and bool(hint)
@@ -268,16 +288,31 @@ def check_incidents(rows: list[dict]) -> tuple[list[str], list[str]]:
 
 
 def check_d_group(rows: list[dict]) -> tuple[list[str], list[str]]:
-    """D 组（自由表述）必须 0 候选 —— 句式闸门短路，不发请求，结果确定。"""
+    """
+    D 组（自由表述）必须**没有确定候选** —— 句式闸门短路，不发请求，结果确定。
+
+    注意口径：这里判的是「用户直接可见的候选」= 非 loose 的那批。
+    接上本地 AI 之后，D 组这类句子**可能**多出几个 AI 猜的 loose 候选
+    （前端默认折叠、点开才可见，并且写明"AI 猜的"）—— 那是设计好的行为，不是误报；
+    数量会单独打印出来，免得"0"被误读成"AI 什么也没给"。
+    """
     fails, lines = [], []
-    bad = [(r["query"], r["labels"][0]) for r in rows
-           if r["group"] == "D 自由表述" and r["labels"]]
+    bad, loose_rows = [], []
+    for r in rows:
+        if r["group"] != "D 自由表述":
+            continue
+        if r["visible"]:
+            bad.append((r["query"], r["visible"][0].get("label", "")))
+        if r["loose"]:
+            loose_rows.append((r["query"], len(r["loose"])))
     for q, label in bad:
-        lines.append(f"       {q} → 却给了「{label}」")
-    lines.append(f"  {'✅' if not bad else '❌'} 已知事故 + D 组 误报 = {len(bad)}"
+        lines.append(f"       {q} → 却给了确定候选「{label}」")
+    for q, n in loose_rows:
+        lines.append(f"       （折叠不计入）{q} → AI/预置源给的 loose 候选 {n} 个")
+    lines.append(f"  {'✅' if not bad else '❌'} 已知事故 + D 组 确定候选误报 = {len(bad)}"
                  f"（要求 0；口径说明见下）")
     if bad:
-        fails.append(f"已知事故清单 + D 组里有 {len(bad)} 条误报")
+        fails.append(f"已知事故清单 + D 组里有 {len(bad)} 条确定的误报")
     return fails, lines
 
 
@@ -298,7 +333,11 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if "--quick" in argv or "-q" in argv:
         print("第一层：确定性门槛（--quick，零网络）\n")
-        return search_gates.main()
+        rc = search_gates.main()
+        if rc:
+            return rc
+        print("\n" + "=" * 104)
+        return ai_interpret.main([])
 
     runs = 1
     if "--runs" in argv:
@@ -319,6 +358,8 @@ def main(argv: list[str] | None = None) -> int:
 
     print("=" * 104)
     print(f"第二层：端到端观察（{len(SAMPLES)} 条固定样本 × {runs} 次；只读，不写库、不加订阅）")
+    print("  口径：走的是 rsshub.search()，**不含** app.py 的 AI 兜底 ——")
+    print("        这一层量的是「确定候选」的精度；AI 路径的验收在 tests/ai_interpret.py。")
     print("=" * 104)
 
     passes: list[list[dict]] = []
@@ -329,8 +370,10 @@ def main(argv: list[str] | None = None) -> int:
         passes.append(rows)
         stats, hit = layer_stats(rows)
         if runs > 1:
+            loose_n = sum(len(r["loose"]) for r in rows)
             print("  " + "  ".join(f"{k}={stats.get(k, 0)}" for k in LAYERS)
-                  + f"  净命中={hit}/{len(rows)} = {hit / len(rows) * 100:.0f}%")
+                  + f"  确定命中={hit}/{len(rows)} = {hit / len(rows) * 100:.0f}%"
+                  + f"  loose 候选 {loose_n} 个（折叠，不计入命中）")
 
     # ---------------- 观察值（不判门槛）----------------
     print("\n" + "=" * 104)
@@ -343,12 +386,16 @@ def main(argv: list[str] | None = None) -> int:
              + f"{'区间':>16}"
     print(header)
     print("  " + "-" * (len(header) - 2))
-    for key in ("净命中", *LAYERS):
-        if key == "净命中":
+    for key in ("确定命中", "loose 候选", *LAYERS):
+        if key == "确定命中":
             vals = [h for _, h in per_run]
             cells = [f"{v}/{len(SAMPLES)}" for v in vals]
             rng = f"{min(vals)}~{max(vals)}（{min(vals) / len(SAMPLES) * 100:.0f}%~"
             rng += f"{max(vals) / len(SAMPLES) * 100:.0f}%）"
+        elif key == "loose 候选":
+            vals = [sum(len(r["loose"]) for r in rows) for rows in passes]
+            cells = [str(v) for v in vals]
+            rng = f"{min(vals)}~{max(vals)}"
         else:
             vals = [stats.get(key, 0) for stats, _ in per_run]
             cells = [str(v) for v in vals]
@@ -358,8 +405,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\n  改动前基线（阶段 0 报告，同样受上游抖动影响）：净命中 {base_net}/42 = "
           f"{base_net / 42 * 100:.0f}%，各层 " +
           "  ".join(f"{k}={BASELINE.get(k, 0)}" for k in LAYERS))
-    print("  口径：误报本来就不该算命中；净命中只是观察值 —— 上游 B 站接口会间歇性返回空")
-    print("        （实测「半佛仙人」5 条/1 条、「_warma_」4 条/0 条），所以它不当门槛。")
+    print("  口径：这里统计的是「确定命中」= 有非 loose 候选（用户一眼能看见的那种），")
+    print("        比改动前那份「净命中」更严 —— loose 候选（AI 猜的 / 只是提到平台）"
+          "单列一行，不计入。")
+    print("        它仍然只是观察值：上游 B 站接口会间歇性返回空（实测「半佛仙人」5 条/1 条、"
+          "「_warma_」4 条/0 条），所以它不当门槛。")
 
     # ---------------- 可疑候选观察器 ----------------
     print("\n" + "=" * 104)

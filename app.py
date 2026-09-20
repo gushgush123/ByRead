@@ -35,6 +35,7 @@ import db
 import cookies
 import exporter
 import feed_parser
+import ai
 import net  # noqa: F401  统一网络初始化（让 Python 用系统证书库）
 import rsshub
 from errors import TemporaryFeedError
@@ -895,6 +896,77 @@ def api_toggle_feed(feed_id: int):
 # --------------------------------------------------------------------------- #
 # 搜索即订阅 / 添加订阅
 # --------------------------------------------------------------------------- #
+def _ai_fallback(query: str, result: dict, force: bool = False) -> dict:
+    """
+    正常搜索一个候选都没有时，让本地小模型猜一次（AI 兜底）。
+
+    三条纪律（对应 P0 精度验收，别动）：
+      1. 只在**一个候选都没有**时才跑 —— 有确定性结果时绝不叫 AI，
+         免得它用错的猜测盖掉本来正确的命中；
+      2. AI 猜出来的候选**一律标 match="loose"**，前端默认折叠、点开才可见；
+      3. AI 的耗时算它自己的预算（ai_timeout_seconds），并且只对非链接输入生效，
+         所以不会把 P0 的"失败路径 ≤10 秒"弄破。
+
+    什么时候**自动**叫 AI：只有"用户说的是一句话"（looks_like_sentence，即句式闸门
+    拦下来的那种）才自动跑 —— 那里用户本来就没有任何线索，猜一次是加分。
+    普通点名失败（例如名字打错）不自动跑：模型一次要 3~4 秒，不该让每次失败都变慢，
+    把选择权交给前端那个 ✨ 按钮（它会带 ai=true 再来一次）。
+    """
+    available = ai.enabled() and not rsshub.is_url(query)
+    result["ai_available"] = available
+    result["ai"] = {"used": False, "available": available, "candidates": 0}
+    if not available:
+        return result
+    if result.get("candidates") and not force:
+        return result
+    if not (force or rsshub.looks_like_sentence(query)):
+        return result
+
+    picked = ai.suggest(query, limit=3)
+    if not picked.get("ok"):
+        # AI 也没读懂：保留原来的失败文案（它比"AI 出错了"对用户有用），只补一句说明
+        if picked.get("note"):
+            result["hint"] = (result.get("hint") or "") + "（" + picked["note"] + "）"
+        result["ai"] = {"used": True, "candidates": 0, "rewritten": "",
+                        "platform": "", "platform_label": "", "keyword": "",
+                        "reason": "", "raw": picked.get("raw") or "",
+                        "note": picked.get("note") or "",
+                        "elapsed_ms": picked.get("elapsed_ms", 0),
+                        "cold": bool(picked.get("cold"))}
+        return result
+
+    seen = {c.get("feed_url") or c.get("label") for c in result.get("candidates") or []}
+    added = 0
+    for c in picked.get("candidates") or []:
+        key = c.get("feed_url") or c.get("label")
+        if key in seen:
+            continue
+        seen.add(key)
+        c["subscribed"] = False          # 下面统一重算
+        result.setdefault("candidates", []).append(c)
+        added += 1
+
+    result["ai"] = {"used": True, "candidates": added,
+                    "rewritten": picked.get("rewritten") or "",
+                    "platform": picked.get("platform") or "",
+                    "platform_label": picked.get("platform_label") or "",
+                    "keyword": picked.get("keyword") or "",
+                    "reason": picked.get("reason") or "",
+                    "raw": picked.get("raw") or "",
+                    "note": picked.get("note") or "",
+                    "elapsed_ms": picked.get("elapsed_ms", 0),
+                    "cold": bool(picked.get("cold"))}
+    if added:
+        head = f"这句话我没直接读懂。本地 AI 猜你可能是想订「{picked.get('platform_label') or '某个平台'} · {picked.get('keyword')}」"
+        if picked.get("reason"):
+            head += f"（{picked['reason']}）"
+        result["hint"] = (head + f"，下面 {added} 个是它猜的候选（不确定，已收起）。"
+                                 "不对的话，可以点「用它再搜一次」或换个说法。")
+    elif picked.get("note"):
+        result["hint"] = (result.get("hint") or "") + "（" + picked["note"] + "）"
+    return result
+
+
 @app.post("/api/search")
 def api_search():
     payload = request.get_json(silent=True) or {}
@@ -906,11 +978,55 @@ def api_search():
     except Exception as exc:  # noqa: BLE001
         log.exception("搜索失败：%s", exc)
         return jsonify({"candidates": [], "hint": "搜索出错了，稍后再试或直接粘贴订阅地址"})
+    try:
+        result = _ai_fallback(query, result, force=bool(payload.get("ai")))
+    except Exception as exc:  # noqa: BLE001  AI 是加分项，坏了也不能影响搜索
+        log.info("AI 兜底失败（忽略）：%s", exc)
+    # AI 候选（loose）排在确定候选后面，用户第一眼看到的是闸门判过的那批
+    cands = result.get("candidates") or []
+    if any(c.get("match") == "loose" for c in cands):
+        result["candidates"] = [c for c in cands if c.get("match") != "loose"] + \
+                               [c for c in cands if c.get("match") == "loose"]
     # 标记已经订阅过的候选，前端好提示
     existing = {f["feed_url"] for f in db.get_feeds()}
     for c in result.get("candidates", []):
         c["subscribed"] = bool(c.get("feed_url") and c["feed_url"] in existing)
     return jsonify(result)
+
+
+# --------------------------------------------------------------------------- #
+# 本地 AI 助手（AI 实验室 / 弹窗里的 ✨ 兜底都用这两个接口）
+# --------------------------------------------------------------------------- #
+@app.get("/api/ai/status")
+def api_ai_status():
+    """模型状态。?warm=1 时顺手同步预热一次（设置页的"检测"按钮用，最长等 60 秒）。"""
+    try:
+        if request.args.get("warm"):
+            ai.warm_up()
+        return jsonify(ai.status())
+    except Exception as exc:  # noqa: BLE001
+        log.info("AI 状态查询失败：%s", exc)
+        return jsonify({"enabled": False, "available": False,
+                        "detail": f"状态查询失败：{type(exc).__name__}"})
+
+
+@app.post("/api/ai/interpret")
+def api_ai_interpret():
+    """
+    让本地模型解析一句话（**只返回意图，不返回候选**）。
+
+    用途：设置页的「AI 实验室」试一句、以及弹窗里"看不见候选"时用户想看看 AI 怎么理解。
+    返回里带 raw（模型原话），方便用户/开发者判断是提示词问题还是模型能力问题。
+    """
+    payload = request.get_json(silent=True) or {}
+    query = (payload.get("q") or payload.get("query") or "").strip()
+    if not query:
+        return jsonify({"ok": False, "error": "没有输入内容"}), 400
+    try:
+        return jsonify(ai.interpret(query))
+    except Exception as exc:  # noqa: BLE001
+        log.info("AI 解析失败：%s", exc)
+        return jsonify({"ok": False, "error": f"AI 调用失败：{type(exc).__name__}"})
 
 
 def _add_feed_from_url(url: str) -> tuple[Optional[dict], Optional[str]]:
@@ -1453,6 +1569,11 @@ if __name__ == "__main__":
     if HOST not in ("127.0.0.1", "localhost"):
         log.info("监听地址是 %s：局域网/公网可以访问，建议同时设置 BYREAD_TOKEN 访问口令", HOST)
     threading.Thread(target=_scheduler_loop, name="byread-scheduler", daemon=True).start()
+    # 顺手把本地小模型预热一下：冷启动实测 5~11 秒，放后台就不会让用户等
+    try:
+        ai.start_prewarm()
+    except Exception as exc:  # noqa: BLE001
+        log.info("AI 预热未启动（忽略）：%s", exc)
     log.info("白读已启动 → http://%s:%d（按 Ctrl+C 停止）",
              "127.0.0.1" if HOST in ("0.0.0.0", "::") else HOST, PORT)
     # 关闭 reloader：避免调度线程被重复启动

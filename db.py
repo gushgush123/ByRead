@@ -47,6 +47,14 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "search_relevance_jaccard": "0.5",      # 字符集合 Jaccard 相似度下限
     "search_sentence_markers": "",          # 逗号分隔；命中则不去跑平台名字搜索
     "search_budget_seconds": "8",           # 整条解析链的总时间预算（秒）
+    "search_loose_collapsed": "true",       # 前端默认折叠 loose 候选（不确定的那些）
+    # 本地 AI 助手（P0 之后的 AI 实验功能）：只用本机 Ollama，不联网、不需要 API key。
+    # 它只在"正常搜索一个候选都没有"时出手，猜出来的候选一律标 loose 且默认折叠。
+    "ai_enabled": "true",                   # 关掉 = 完全不走 AI（入口也不显示）
+    "ai_base_url": "http://127.0.0.1:11434",
+    "ai_model": "qwen3:4b-instruct-2507-q4_K_M",
+    "ai_timeout_seconds": "6",              # AI 自己的预算，不占 search_budget_seconds
+    "ai_prewarm": "true",                   # 启动时后台预热模型（冷启动实测 5~11 秒）
     # 监听地址（给将来的多端/托管留的口子）。环境变量 BYREAD_HOST / BYREAD_PORT 优先，
     # 默认仍然只监听本机 127.0.0.1:5000 —— 局域网也访问不到，这是有意的安全默认
     "bind_host": "127.0.0.1",

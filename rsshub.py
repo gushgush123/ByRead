@@ -670,6 +670,33 @@ def _fmt_fans(n: int) -> str:
     return str(n)
 
 
+def platform_candidates(platform: str, keyword: str, limit: int = 4) -> list[dict]:
+    """
+    按"平台 + 名字"直接问平台搜索接口，返回候选 —— **不过相关度闸门**。
+
+    给谁用：ai.py 的 AI 兜底路径。那里要搜的名字是模型猜出来的（可能是「财经」这种泛词），
+    P0 的相关度闸门判的是"用户给的名字 vs 候选名"，会把这类结果全滤光，AI 就永远给不出东西。
+    所以**安全性不在这道闸门，而在调用方**：
+        · 候选只能来自平台搜索接口的真实返回（AI 编不出不存在的账号）；
+        · AI 路径上的候选必须标 match="loose"，前端默认折叠、点开才可见。
+    普通搜索路径请继续用 search()，**不要**用这个函数绕过闸门。
+    """
+    platform = (platform or "").strip().lower()
+    keyword = (keyword or "").strip()
+    if not keyword:
+        return []
+    try:
+        if platform == "bilibili":
+            return _bilibili_candidates(keyword, limit=limit)[0]
+        if platform == "zhihu":
+            return _zhihu_candidates(keyword, limit=limit)
+        if platform == "weibo":
+            return _weibo_candidates(keyword, limit=limit)
+    except Exception as exc:  # noqa: BLE001  搜索失败就当没猜出来，不往上抛
+        log.info("platform_candidates 失败（%s / %s）：%s", platform, keyword, exc)
+    return []
+
+
 # --------------------------------------------------------------------------- #
 # 解析链总时间预算（P0 精度修复之三）
 #
