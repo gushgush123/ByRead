@@ -85,10 +85,11 @@ def _headers(cookie: Optional[str], uid: Optional[str] = None) -> dict:
 
 
 def _get(path: str, cookie: Optional[str], params: Optional[dict] = None,
-         uid: Optional[str] = None) -> requests.Response:
+         uid: Optional[str] = None, timeout: Optional[float] = None) -> requests.Response:
     _throttle()
     return _session.get(
-        API + path, headers=_headers(cookie, uid), params=params or {}, timeout=TIMEOUT
+        API + path, headers=_headers(cookie, uid), params=params or {},
+        timeout=(timeout or TIMEOUT)
     )
 
 
@@ -157,7 +158,8 @@ def get_user(uid: str, cookie: str) -> dict:
 # --------------------------------------------------------------------------- #
 # 按关键词找人（尽力而为）
 # --------------------------------------------------------------------------- #
-def search_users(keyword: str, cookie: str, limit: int = 5) -> list[dict]:
+def search_users(keyword: str, cookie: str, limit: int = 5,
+                 timeout: Optional[float] = None) -> list[dict]:
     """
     m.weibo.cn 的综合搜索接口，能不能用取决于账号的搜索权限与风控，
     失败就返回空，上层会退化成"请粘贴主页链接"。
@@ -168,6 +170,7 @@ def search_users(keyword: str, cookie: str, limit: int = 5) -> list[dict]:
             "/container/getIndex",
             cookie,
             {"containerid": containerid, "page_type": "searchall"},
+            timeout=timeout,
         )
         if resp.status_code >= 400:
             log.info("微博搜索返回 HTTP %s", resp.status_code)

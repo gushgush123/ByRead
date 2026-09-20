@@ -919,10 +919,22 @@ def _add_feed_from_url(url: str) -> tuple[Optional[dict], Optional[str]]:
       1. 平台主页识别（B站空间 / 知乎 / 微博 / 少数派…）
       2. 这个地址本身就是订阅地址 → 直接校验
       3. 普通网页 → 自动发现里面的订阅地址（每个候选都必须真实解析成功）
+
+    整条链共用一个时间预算（settings: search_budget_seconds，默认 8s）：
+    否则"平台识别 10s + 校验 10s + 发现页面 10s + 试 10 个常见路径各 10s"
+    会让"粘贴一个不支持的链接"变成用户面前几十秒的白屏（实测 26~45 秒）。
+
+    性能上的一个取舍：以前无论地址长什么样都先 probe 一遍。实测一个普通网页
+    （B 站视频页）光这一次 probe 就要发 **两个**请求（截断探测 + 解析不出条目后整份重试）
+    约 1.5~2s，而结论必然是"不是源"。所以现在只在**地址本身长得像订阅地址**
+    （.xml / /feed / atom 结尾）时才单独校验；其余一律交给自动发现 ——
+    它同样会"真实解析成功才算数"，而且会把页面本身也当候选试一次。
     """
     url = (url or "").strip()
     if not url.lower().startswith(("http://", "https://")):
         return None, "只能添加 http 或 https 开头的地址"
+
+    budget = rsshub._search_budget()  # noqa: SLF001
 
     candidate = rsshub.resolve_url(url)
     if candidate:
@@ -933,22 +945,31 @@ def _add_feed_from_url(url: str) -> tuple[Optional[dict], Optional[str]]:
         info["description"] = candidate.get("detail")
         return info, None
 
-    probe = feed_parser.probe_feed_url(url)
-    if probe["ok"] and probe.get("entry_count"):
-        return (
-            {
-                "feed_url": url,
-                "title": probe.get("title") or url,
-                "site_url": probe.get("site_url"),
-                "icon": probe.get("icon"),
-                "description": probe.get("description"),
-                "platform": None,
-            },
-            None,
-        )
+    if budget.expired():
+        return None, rsshub._TIMEOUT_HINT  # noqa: SLF001
 
-    # 走到这里说明它是个普通网页（或抓不到内容）—— 试着从页面里找订阅地址
-    found = feed_parser.discover_feeds(url)
+    # 地址本身就像订阅地址 → 直接校验（快，不用先当网页解析一遍）
+    if rsshub.looks_like_feed_url(url):
+        probe = feed_parser.probe_feed_url(url, timeout=budget.request_timeout(10))
+        if probe["ok"] and probe.get("entry_count"):
+            return (
+                {
+                    "feed_url": url,
+                    "title": probe.get("title") or url,
+                    "site_url": probe.get("site_url"),
+                    "icon": probe.get("icon"),
+                    "description": probe.get("description"),
+                    "platform": None,
+                },
+                None,
+            )
+        if budget.expired():
+            return None, rsshub._TIMEOUT_HINT  # noqa: SLF001
+
+    # 普通网页（或抓不到内容）—— 试着从页面里找订阅地址。
+    # 这个地址如果本来就是 feed，discover_feeds 会把它自己当候选并真实解析一次，
+    # 所以上面的单独校验省掉了也不会漏。
+    found = feed_parser.discover_feeds(url, deadline=budget.deadline)
     if found:
         best = found[0]
         log.info("从 %s 自动发现订阅地址：%s", url, best["feed_url"])
@@ -963,6 +984,8 @@ def _add_feed_from_url(url: str) -> tuple[Optional[dict], Optional[str]]:
             },
             None,
         )
+    if budget.expired():
+        return None, rsshub._TIMEOUT_HINT  # noqa: SLF001
     return None, "这个网页里没找到订阅地址。看看页面底部有没有 RSS / 订阅 链接"
 
 

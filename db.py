@@ -46,6 +46,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "search_relevance_lcs": "0.6",          # 最长公共子串 ÷ len(查询) 的下限
     "search_relevance_jaccard": "0.5",      # 字符集合 Jaccard 相似度下限
     "search_sentence_markers": "",          # 逗号分隔；命中则不去跑平台名字搜索
+    "search_budget_seconds": "8",           # 整条解析链的总时间预算（秒）
     # 监听地址（给将来的多端/托管留的口子）。环境变量 BYREAD_HOST / BYREAD_PORT 优先，
     # 默认仍然只监听本机 127.0.0.1:5000 —— 局域网也访问不到，这是有意的安全默认
     "bind_host": "127.0.0.1",

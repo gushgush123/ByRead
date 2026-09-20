@@ -263,7 +263,8 @@ def _needs_cookie_hint(platform: str, cookie_ready: bool) -> str:
             "（想直接输入名字搜，可以在设置页 → 登录信息 里配置一次）")
 
 
-def _zhihu_candidates(keyword: str, limit: int = 4) -> list[dict]:
+def _zhihu_candidates(keyword: str, limit: int = 4,
+                      budget: Optional[Budget] = None) -> list[dict]:
     """知乎按名字找人（需要登录信息，尽力而为）。登录失效会抛异常，由调用方转成提示。"""
     import cookies
 
@@ -273,7 +274,8 @@ def _zhihu_candidates(keyword: str, limit: int = 4) -> list[dict]:
     try:
         import zhihu
 
-        users = zhihu.search_people(keyword, cookie, limit=limit)
+        users = zhihu.search_people(keyword, cookie, limit=limit,
+                                    timeout=(budget.request_timeout(10) if budget else 10))
     except zhihu.ZhihuAuthError:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -297,7 +299,8 @@ def _zhihu_candidates(keyword: str, limit: int = 4) -> list[dict]:
     return out
 
 
-def _weibo_candidates(keyword: str, limit: int = 4) -> list[dict]:
+def _weibo_candidates(keyword: str, limit: int = 4,
+                      budget: Optional[Budget] = None) -> list[dict]:
     """微博按名字找人（需要登录信息，尽力而为）。登录失效会抛异常，由调用方转成提示。"""
     import cookies
 
@@ -307,7 +310,8 @@ def _weibo_candidates(keyword: str, limit: int = 4) -> list[dict]:
     try:
         import weibo
 
-        users = weibo.search_users(keyword, cookie, limit=limit)
+        users = weibo.search_users(keyword, cookie, limit=limit,
+                                   timeout=(budget.request_timeout(10) if budget else 10))
     except weibo.WeiboAuthError:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -627,12 +631,15 @@ def _preset_candidate(preset: dict, match: str = "exact") -> dict:
 # --------------------------------------------------------------------------- #
 # L3：关键词 → 候选列表
 # --------------------------------------------------------------------------- #
-def _bilibili_candidates(keyword: str, limit: int = 4) -> tuple[list[dict], Optional[str]]:
-    """B 站原生搜索。返回 (候选列表, 错误提示)。"""
+def _bilibili_candidates(keyword: str, limit: int = 4,
+                         budget: Optional[Budget] = None) -> tuple[list[dict], Optional[str]]:
+    """B 站原生搜索。返回 (候选列表, 错误提示)。timeout 取整条链预算的剩余量。"""
     try:
         import bilibili
 
-        users = bilibili.search_users(keyword, limit=limit)
+        users = bilibili.search_users(
+            keyword, limit=limit, timeout=(budget.request_timeout(10) if budget else 10)
+        )
     except Exception as exc:  # noqa: BLE001
         log.warning("B 站搜索失败：%s", exc)
         return [], "B 站暂时搜不了，稍后再试"
@@ -661,6 +668,63 @@ def _fmt_fans(n: int) -> str:
     if n >= 10000:
         return f"{n / 10000:.1f}万"
     return str(n)
+
+
+# --------------------------------------------------------------------------- #
+# 解析链总时间预算（P0 精度修复之三）
+#
+# 背景：实测粘贴一个不支持的链接要 26～45 秒才失败。原因不是"某一次请求慢"，
+# 而是**没有总预算**：页面抓 10s + 最多 10 个候选各 10s（每个候选还可能重定向），
+# 而用户在前端只能看到转圈。
+#
+# 做法：整条链一个 deadline，每次网络调用取 min(剩余预算, 单次上限)；
+# 预算耗尽立刻返回干净失败，不再去试别的路径。
+# --------------------------------------------------------------------------- #
+# 每次网络调用要预留的"不可控开销"（秒）：DNS 解析 / TLS 握手不被 requests 的 timeout 覆盖。
+# 实测：传入 timeout=2.03s 的那次调用实际跑了 3.90s。预算必须留出这段才叫"硬上限"。
+_REQUEST_OVERHEAD = 1.5
+
+
+class Budget:
+    """整条解析链的时间预算（秒）。用单调时钟，不受系统时间调整影响。"""
+
+    def __init__(self, seconds: float):
+        self.total = max(0.5, float(seconds))
+        self.deadline = time.monotonic() + self.total
+
+    def remaining(self) -> float:
+        return max(0.0, self.deadline - time.monotonic())
+
+    def expired(self) -> bool:
+        """留一点收尾余量：低于 0.2s 就当没时间了。"""
+        return self.remaining() <= 0.2
+
+    def slice(self, cap: float) -> float:
+        """这一次调用能用多少秒：min(剩余, 单次上限)，至少给 0.5s 免得直接无效。"""
+        return max(0.5, min(float(cap), self.remaining()))
+
+    def request_timeout(self, cap: float = 10.0) -> tuple[float, float]:
+        """
+        给 requests 用的超时：(连接上限, 读取上限)，且两者之和 ≤ 本次可用时间 - 预留开销。
+
+        requests 的标量 timeout 是"建立连接"和"读取"**各自**的上限 ——
+        给一个数就等于允许最坏两倍，8s 的预算会跑出 9.9s（实测贴边冲破 10s 验收）。
+        另外 DNS 解析 / TLS 握手根本不在 timeout 覆盖范围内（实测有单次调用
+        超时 2.03s 却实跑 3.90s），所以每次调用还要留出 _REQUEST_OVERHEAD 的余量。
+        拆成二元组 + 留余量后，单次调用的最坏耗时仍落在预算内。
+        """
+        s = max(0.5, self.slice(cap) - _REQUEST_OVERHEAD)
+        connect = max(0.5, min(3.5, s / 2))
+        return (connect, max(0.5, s - connect))
+
+
+def _search_budget() -> Budget:
+    return Budget(_setting_float("search_budget_seconds", 8.0))
+
+
+# 预算耗尽时的统一说法：不要笼统说"网络错误"，要让用户知道"不是没这个东西，是没查完"
+_TIMEOUT_HINT = ("这个地址查起来太慢了，我先停在这儿（没查完，不代表它不能订）。"
+                 "可以直接给我订阅地址（.xml / /feed 结尾），或者过一会儿再试。")
 
 
 # --------------------------------------------------------------------------- #
@@ -879,15 +943,19 @@ def _preset_matches(platform: Optional[str], keyword: str) -> tuple[list[dict], 
     return exact, loose
 
 
-def discover_candidates(page_url: str) -> list[dict]:
+def discover_candidates(page_url: str,
+                        budget: Optional[Budget] = None) -> list[dict]:
     """
     从一个普通网页里自动发现订阅地址，转成候选格式交给现有弹窗。
     只有**真实解析成功**的地址才会被返回（绝不允许把首页 HTML 当成 feed）。
+    budget：整条解析链的时间预算，透传成绝对 deadline 给 feed_parser，
+    让"打开页面 + 试 N 个常见路径"共用同一份预算，而不是各花各的 10 秒。
     """
     try:
         import feed_parser
 
-        found = feed_parser.discover_feeds(page_url)
+        found = feed_parser.discover_feeds(
+            page_url, deadline=(budget.deadline if budget else None))
     except Exception as exc:  # noqa: BLE001
         log.info("自动发现订阅地址失败：%s %s", page_url, exc)
         return []
@@ -907,7 +975,7 @@ def discover_candidates(page_url: str) -> list[dict]:
     return out
 
 
-def search(query: str) -> dict:
+def search(query: str, budget: Optional[Budget] = None) -> dict:
     """
     搜索即订阅的统一入口。返回：
     {"candidates": [...], "hint": str|None, "notes": [str]}
@@ -916,10 +984,17 @@ def search(query: str) -> dict:
       1. 预置源 / 平台识别（少数派、B站空间、知乎主页…）
       2. 这本身就是一个订阅地址 → 直接校验添加
       3. 自动发现：打开这个网页，从里面找出订阅地址（每个都必须真实解析成功）
+
+    budget：整条解析链的时间预算（settings: search_budget_seconds，默认 8s）。
+    不传就按设置新建一个 —— 保证"无论走到哪一层，总耗时都有上限"，
+    而不是某一层 10s、下一层再 10s、用户面前转几十秒。
     """
     query = (query or "").strip()
     if not query:
         return {"candidates": [], "hint": "输入博主名、平台名或订阅地址", "notes": []}
+
+    if budget is None:
+        budget = _search_budget()
 
     # L1：链接
     if is_url(query):
@@ -942,10 +1017,16 @@ def search(query: str) -> dict:
                 "hint": None,
                 "notes": [],
             }
+        # 预算已经花光就别再开新请求了：直接干净失败，别让用户干等
+        if budget.expired():
+            log.info("解析预算已用尽（%.1fs），跳过自动发现：%s", budget.total, query)
+            return {"candidates": [], "hint": _TIMEOUT_HINT, "notes": []}
         # L3：普通网页 → 自动发现订阅地址
-        discovered = discover_candidates(query)
+        discovered = discover_candidates(query, budget=budget)
         if discovered:
             return {"candidates": discovered, "hint": None, "notes": []}
+        if budget.expired():
+            return {"candidates": [], "hint": _TIMEOUT_HINT, "notes": []}
         return {
             "candidates": [],
             "hint": "这个网页里没找到订阅地址。可以看看页面底部有没有 RSS / 订阅 链接，"
@@ -989,7 +1070,7 @@ def search(query: str) -> dict:
 
     if platform == "zhihu":
         try:
-            found = [] if sentence_like else _zhihu_candidates(keyword)
+            found = [] if sentence_like else _zhihu_candidates(keyword, budget=budget)
         except Exception as exc:  # 登录失效这类问题要说清原因，不能笼统说"没搜到"
             return {"candidates": [], "hint": str(exc), "notes": notes}
         if not found and not sentence_like:
@@ -998,7 +1079,7 @@ def search(query: str) -> dict:
         candidates.extend(_gate_platform_candidates(keyword, found, "知乎"))
     elif platform == "weibo":
         try:
-            found = [] if sentence_like else _weibo_candidates(keyword)
+            found = [] if sentence_like else _weibo_candidates(keyword, budget=budget)
         except Exception as exc:
             return {"candidates": [], "hint": str(exc), "notes": notes}
         if not found and not sentence_like:
@@ -1014,7 +1095,7 @@ def search(query: str) -> dict:
         if sentence_like:
             found, err = [], None
         else:
-            found, err = _bilibili_candidates(keyword)
+            found, err = _bilibili_candidates(keyword, budget=budget)
         candidates.extend(_gate_platform_candidates(keyword, found, "B站"))
         if err:
             notes.append(err)
@@ -1027,13 +1108,13 @@ def search(query: str) -> dict:
         if zhihu_ready:
             try:
                 candidates.extend(_gate_platform_candidates(
-                    keyword, _zhihu_candidates(keyword, limit=3), "知乎"))
+                    keyword, _zhihu_candidates(keyword, limit=3, budget=budget), "知乎"))
             except Exception as exc:  # noqa: BLE001
                 notes.append(str(exc))
         if weibo_ready:
             try:
                 candidates.extend(_gate_platform_candidates(
-                    keyword, _weibo_candidates(keyword, limit=3), "微博"))
+                    keyword, _weibo_candidates(keyword, limit=3, budget=budget), "微博"))
             except Exception as exc:  # noqa: BLE001
                 notes.append(str(exc))
 
@@ -1064,6 +1145,10 @@ def search(query: str) -> dict:
             return {"candidates": [], "hint": (
                 f"「{query}」这句我没读出要订什么。可以直接给「平台 名字」"
                 f"（例如「B站 半佛仙人」），或者把 TA 的主页链接粘过来。"), "notes": notes}
+        if budget.expired():
+            # 没查完就别说"没找到"——那是两件事，说错了会让用户以为这个人不存在
+            log.info("解析预算用尽（%.1fs），返回超时提示：%r", budget.total, query)
+            return {"candidates": [], "hint": _TIMEOUT_HINT, "notes": notes}
         hint = f"没找到叫「{keyword}」的博主。" if keyword else "没找到相关源。"
         hint += "如果你知道 TA 的主页链接（例如 space.bilibili.com/12345），粘过来我就能订。"
         if platform in NEEDS_URL_HINT:

@@ -158,8 +158,10 @@ def _headers(cookie: Optional[str]) -> dict:
     return headers
 
 
-def _get(url: str, cookie: Optional[str], params: Optional[dict] = None) -> requests.Response:
-    return _session.get(url, headers=_headers(cookie), params=params or {}, timeout=TIMEOUT)
+def _get(url: str, cookie: Optional[str], params: Optional[dict] = None,
+         timeout: Optional[float] = None) -> requests.Response:
+    return _session.get(url, headers=_headers(cookie), params=params or {},
+                        timeout=(timeout or TIMEOUT))
 
 
 # --------------------------------------------------------------------------- #
@@ -210,7 +212,8 @@ def get_user(token: str, cookie: str) -> dict:
 # --------------------------------------------------------------------------- #
 # 按关键词找人（需要登录信息，尽力而为）
 # --------------------------------------------------------------------------- #
-def search_people(keyword: str, cookie: str, limit: int = 5) -> list[dict]:
+def search_people(keyword: str, cookie: str, limit: int = 5,
+                  timeout: Optional[float] = None) -> list[dict]:
     """
     知乎的搜索接口对签名很敏感，能不能用取决于账号与风控状态，
     所以这里"尽力而为"：失败就返回空，上层会退化成"请粘贴主页链接"。
@@ -228,6 +231,7 @@ def search_people(keyword: str, cookie: str, limit: int = 5) -> list[dict]:
                 "show_all_topics": 0,
                 "search_source": "Normal",
             },
+            timeout=timeout,
         )
         if resp.status_code >= 400:
             log.info("知乎搜索返回 HTTP %s", resp.status_code)

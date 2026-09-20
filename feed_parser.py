@@ -19,6 +19,7 @@ import html as html_mod
 import importlib
 import logging
 import re
+import time
 from typing import Callable, Optional
 from urllib.parse import urljoin, urlparse
 
@@ -610,7 +611,7 @@ def _decode_by_declaration(raw: bytes):
         return raw
 
 
-def fetch_feed(feed_url: str, timeout: int = TIMEOUT, limit: int = 20,
+def fetch_feed(feed_url: str, timeout: float | tuple[float, float] = TIMEOUT, limit: int = 20,
                content_state: Optional[dict] = None,
                max_bytes: Optional[int] = None) -> dict:
     """
@@ -942,16 +943,16 @@ def extract_article_content(url: str, timeout: int = TIMEOUT,
     return content
 
 
-def probe_feed_url(url: str) -> dict:
+def probe_feed_url(url: str, timeout: float | tuple[float, float] = TIMEOUT) -> dict:
     """
     校验一个地址是否可用作订阅源。返回 {ok, title, site_url, icon, entry_count, error}
     （供"粘贴链接直接添加"用，避免添加一个抓不到的源）
 
     只读开头一小段（PROBE_MAX_BYTES = 256KB）来判定，避免大源（播客源整份接近 10MB）
-    把订阅接口拖成几十秒。
+    把订阅接口拖成几十秒。timeout 由调用方按"整条链剩下的预算"传进来。
     """
     try:
-        data = fetch_feed(url, limit=1, max_bytes=PROBE_MAX_BYTES)
+        data = fetch_feed(url, limit=1, max_bytes=PROBE_MAX_BYTES, timeout=timeout)
         return {
             "ok": True,
             "title": data.get("title") or url,
@@ -973,6 +974,10 @@ _FEED_LINK_TYPES = ("application/rss+xml", "application/atom+xml", "application/
                     "text/xml", "application/rdf+xml", "application/feed+json")
 # 找不到 link 标签时，依次试这些常见路径
 COMMON_FEED_PATHS = ("/feed", "/rss", "/atom.xml", "/feed.xml", "/index.xml", "/rss.xml")
+# 每次网络调用要预留的"不可控开销"（秒）：DNS 解析 / TLS 握手不被 requests 的 timeout 覆盖。
+# 实测：某次调用传入 timeout=1.91s、实际跑了 3.92s（超出 2.0s）。预留 2.0s 之后，
+# 整条"打开页面 + 试常见路径"链才会在预算内收工，而不是超 1.5s 顶到 10s 验收线。
+_REQUEST_OVERHEAD = 2.0
 _FEEDISH_PATH_RE = re.compile(r"(^|/)(feed|rss|atom)(\.(xml|rss|json))?$", re.IGNORECASE)
 
 
@@ -1034,6 +1039,18 @@ def extract_feed_links(page_url: str, page_html: str) -> list[str]:
     return out
 
 
+def _looks_like_feed_body(text: str) -> bool:
+    """
+    光看开头几个字节判断"这堆文本本身是不是 RSS/Atom"。
+    用途：有些源被服务端标成 text/html，走 HTML 分支会把最可能的答案漏掉。
+    只看开头 4KB，成本可以忽略——绝不能为了这个再发一次请求。
+    """
+    head = (text or "")[:4096].lstrip().lower()
+    if not head.startswith(("<?xml", "<rss", "<feed", "<rdf")):
+        return False
+    return any(tag in head for tag in ("<rss", "<feed", "<rdf:rdf", "<channel"))
+
+
 def candidate_feed_urls(page_url: str) -> list[str]:
     """
     在**不发请求**的前提下，列出这个页面所有可能的订阅地址：
@@ -1060,7 +1077,7 @@ def candidate_feed_urls(page_url: str) -> list[str]:
 
 
 def discover_feeds(page_url: str, timeout: int = TIMEOUT, need: int = 3,
-                   max_checks: int = 10) -> list[dict]:
+                   max_checks: int = 10, deadline: Optional[float] = None) -> list[dict]:
     """
     从一个普通网页里自动找出可用的订阅地址。
 
@@ -1070,13 +1087,43 @@ def discover_feeds(page_url: str, timeout: int = TIMEOUT, need: int = 3,
       3. **每个候选都必须真实解析成功**才算数（复用 probe_feed_url）——
          绝不允许把首页 HTML 当成 feed 存进库
     最多检查 max_checks 个候选，凑够 need 个能用的就提前返回。
+
+    deadline（time.monotonic() 的绝对时刻）是**整条解析链的总预算**：
+    每次请求的 timeout 取 min(剩余预算, timeout)，预算用完立刻收工 ——
+    否则"页面 10s + 10 个候选各 10s"会变成用户面前几十秒的转圈（实测 26~45 秒）。
     """
     if not page_url or not page_url.lower().startswith(("http://", "https://")):
         return []
 
+    def budget_left() -> float:
+        return (deadline - time.monotonic()) if deadline else float(timeout)
+
+    def step_timeout() -> Optional[float]:
+        left = budget_left()
+        # 预留 _REQUEST_OVERHEAD：requests 的 timeout 只管"连上以后"，DNS 解析 / TLS 握手
+        # 的耗时不在它覆盖范围内 —— 实测有单次调用超时 2.03s 却实际跑了 3.90s。
+        # 不预留这一段，预算就会变成"软"的（8s 预算跑出 10.1s，直接顶破 10s 验收）。
+        if left <= _REQUEST_OVERHEAD + 0.5:
+            return None
+        return max(0.5, min(float(timeout), left - _REQUEST_OVERHEAD))
+
+    def req_timeout(step: float):
+        """
+        requests 的 timeout 是"建立连接"和"读取"**各自**的上限，给个标量意味着
+        最坏情况是它的两倍 —— 实测预算是 8s 时整条链跑到 9.9s（贴边过 10s 验收）。
+        这里给二元组，并且让 连接 + 读取 ≤ step：连接最多 step/2（不超过 3.5s），
+        读取拿剩下的部分。这样"单次调用"的最坏耗时就被 step 钉死了。
+        """
+        connect = max(0.5, min(3.5, step / 2))
+        return (connect, max(0.5, step - connect))
+
     candidates: list[str] = []
+    first_timeout = step_timeout()
+    if first_timeout is None:
+        log.info("自动发现：预算已用完，直接放弃 %s", page_url)
+        return []
     try:
-        resp = _requests.get(page_url, timeout=timeout, allow_redirects=True,
+        resp = _requests.get(page_url, timeout=req_timeout(first_timeout), allow_redirects=True,
                              headers={"User-Agent": UA,
                                       "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"})
         final_url = resp.url
@@ -1085,6 +1132,11 @@ def discover_feeds(page_url: str, timeout: int = TIMEOUT, need: int = 3,
             if not resp.encoding or resp.encoding.lower() in ("iso-8859-1", "ascii"):
                 resp.encoding = resp.apparent_encoding or "utf-8"
             candidates = extract_feed_links(final_url, resp.text)
+            # 有些源被服务端错误地标成 text/html（其实正文就是 RSS/Atom）。
+            # 这时页面本身就是答案 —— 排在最前面直接试，免得白跑一遍常见路径。
+            if _looks_like_feed_body(resp.text):
+                log.info("这个页面其实是一份订阅源内容（Content-Type 标错了）：%s", final_url)
+                candidates.insert(0, final_url)
             page_url = final_url
         elif resp.status_code < 400:
             # 这个地址本身可能就是一个 feed
@@ -1097,8 +1149,14 @@ def discover_feeds(page_url: str, timeout: int = TIMEOUT, need: int = 3,
             candidates.append(url)
 
     results: list[dict] = []
+    checked = 0
     for url in candidates[:max_checks]:
-        probe = probe_feed_url(url)
+        step = step_timeout()
+        if step is None:
+            log.info("自动发现：预算用完，停止检查剩余候选项（已检查 %s 个）", checked)
+            break
+        checked += 1
+        probe = probe_feed_url(url, timeout=req_timeout(step))
         if not probe.get("ok"):
             continue
         if not probe.get("entry_count"):
@@ -1115,5 +1173,5 @@ def discover_feeds(page_url: str, timeout: int = TIMEOUT, need: int = 3,
         if len(results) >= need:
             break
     log.info("自动发现：检查 %s 个候选，可用 %s 个（%s）",
-             min(len(candidates), max_checks), len(results), page_url)
+             checked, len(results), page_url)
     return results

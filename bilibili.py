@@ -133,7 +133,7 @@ class _Session:
         return urllib.parse.urlencode(sorted(params.items()))
 
     def get_json(self, url: str, params: Optional[dict] = None,
-                 signed: bool = False) -> dict:
+                 signed: bool = False, timeout: Optional[float] = None) -> dict:
         """发起请求并解析 JSON，失败重试一次（含重建密钥）。"""
         last_err: Optional[Exception] = None
         for attempt in range(2):
@@ -145,7 +145,7 @@ class _Session:
                 else:
                     full = url
                 r = self._s.get(full, params=None if signed else (params or {}),
-                                timeout=TIMEOUT)
+                                timeout=(timeout or TIMEOUT))
                 if r.status_code == 412:
                     # 412 = 风控，重建 Cookie/密钥后重试
                     self._s.cookies.clear()
@@ -177,7 +177,7 @@ _session = _Session()
 # --------------------------------------------------------------------------- #
 # 对外接口
 # --------------------------------------------------------------------------- #
-def search_users(keyword: str, limit: int = 6) -> list[dict]:
+def search_users(keyword: str, limit: int = 6, timeout: Optional[float] = None) -> list[dict]:
     """
     按关键词搜索 B 站 UP 主。
     返回 [{mid, uname, fans, sign, avatar, platform}]
@@ -190,6 +190,7 @@ def search_users(keyword: str, limit: int = 6) -> list[dict]:
             "https://api.bilibili.com/x/web-interface/wbi/search/type",
             {"search_type": "bili_user", "keyword": keyword, "page": 1},
             signed=True,
+            timeout=timeout,
         )
     except BilibiliError as exc:
         log.warning("B 站搜索失败：%s", exc)
