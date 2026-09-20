@@ -664,6 +664,137 @@ def _fmt_fans(n: int) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# 平台搜索结果的相关度闸门（P0 精度修复之二）
+#
+# 背景：B 站搜索接口对**任意字符串**都会返回一批 UP 主（模糊匹配），
+# 而我们把 Top N 直接当候选端出去了 —— 于是「今天天气不错」也能给出
+# 「B站 · py今天天气不错」、「隔壁老王的空间」给出「B站 · 隔壁空间站的老王」。
+# 用户看到"已添加"，然后读着陌生人的内容，全程没有报错。这是最坏的一类体验。
+#
+# 两道关：
+#   1. **这不是个名字，是句话** → 干脆不搜（搜索接口对句子只会瞎给）。
+#      判据是可配置的句式词表（settings: search_sentence_markers）。
+#   2. 名称相关度：查询词与候选名必须"像同一个东西"才留下，阈值可配置。
+#      ⚠️ 光靠相关度是不够的：实测「今天天气不错」⊂「py今天天气不错」、
+#      「半佛仙人」⊂「硬核的半佛仙人」在数学上完全同构（都是前缀包含、LCS 比都是 1.0），
+#      任何阈值都无法把它们分开 —— 所以第 1 关（句式词）才是消除那类事故的关键。
+# --------------------------------------------------------------------------- #
+_BRACKET_RE = re.compile(r"[【\[（(][^】\]）)]*[】\]）)]")
+_EMOJI_RE = re.compile(
+    "[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U0001F1E6-\U0001F1FF"
+    "\u2b00-\u2bff\u2190-\u21ff\u2700-\u27bf\u2122\u00ae\u00a9]+"
+)
+
+# 句式词：出现这些，说明用户在"说话/提问"，不是在给一个博主名
+DEFAULT_SENTENCE_MARKERS = (
+    "帮我", "我想", "我要", "有没有", "什么", "怎么", "为什么", "是不是", "能不能",
+    "那个", "这个", "每天", "空间", "主页", "频道", "账号", "博主", "主播", "天气", "不错",
+    "推荐个", "来一个", "订阅个",
+)
+
+
+def _setting_float(key: str, default: float) -> float:
+    try:
+        raw = db.get_setting(key)
+        return float(raw) if raw not in (None, "") else default
+    except (TypeError, ValueError):
+        log.warning("设置 %s 不是数字，用默认值 %s", key, default)
+        return default
+
+
+def _sentence_markers() -> tuple[str, ...]:
+    """句式词表：settings 里可覆盖（逗号分隔），默认见 DEFAULT_SENTENCE_MARKERS。"""
+    raw = (db.get_setting("search_sentence_markers") or "").strip()
+    if not raw:
+        return DEFAULT_SENTENCE_MARKERS
+    parts = [p.strip() for p in re.split(r"[,，\s]+", raw) if p.strip()]
+    return tuple(parts) or DEFAULT_SENTENCE_MARKERS
+
+
+def looks_like_sentence(text: str) -> bool:
+    """粗判"这句话不是在说一个名字"（用于决定**不**去跑平台名字搜索）。"""
+    if not text:
+        return False
+    t = _norm(text)
+    return any(_norm(m) and _norm(m) in t for m in _sentence_markers())
+
+
+def _norm_name(text: str) -> str:
+    """候选名归一化：去括号内容（【】[]（）()）、去 emoji，再走通用归一化。"""
+    t = _BRACKET_RE.sub("", text or "")
+    t = _EMOJI_RE.sub("", t)
+    return _norm(t)
+
+
+def _lcs_len(a: str, b: str) -> int:
+    """最长公共子串长度（编辑距离那套的 O(n*m) DP；名字都很短，够用）。"""
+    if not a or not b:
+        return 0
+    prev = [0] * (len(b) + 1)
+    best = 0
+    for i in range(1, len(a) + 1):
+        cur = [0] * (len(b) + 1)
+        for j in range(1, len(b) + 1):
+            if a[i - 1] == b[j - 1]:
+                cur[j] = prev[j - 1] + 1
+                best = max(best, cur[j])
+        prev = cur
+    return best
+
+
+def _jaccard(a: str, b: str) -> float:
+    sa, sb = set(a), set(b)
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / len(sa | sb)
+
+
+def relevance(query: str, name: str) -> tuple[bool, float, str]:
+    """
+    判断"候选名"是不是用户要找的东西。返回 (是否保留, 得分, 原因)。
+
+    保留条件（任一，阈值可配置）：
+      · 互为子串（「半佛仙人」↔「硬核的半佛仙人」）
+      · 最长公共子串 ÷ len(query) ≥ search_relevance_lcs（默认 0.6）
+      · 字符集合 Jaccard ≥ search_relevance_jaccard（默认 0.5）
+    """
+    q, n = _norm_name(query), _norm_name(name)
+    if not q or not n:
+        return False, 0.0, "空"
+    if q == n:
+        return True, 1.0, "完全相同"
+    if q in n or n in q:
+        score = min(len(q), len(n)) / max(len(q), len(n))
+        return True, score, "互相包含"
+    lcs_min = _setting_float("search_relevance_lcs", 0.6)
+    jac_min = _setting_float("search_relevance_jaccard", 0.5)
+    lcs_ratio = _lcs_len(q, n) / len(q)
+    if lcs_ratio >= lcs_min:
+        return True, lcs_ratio, f"公共子串比 {lcs_ratio:.2f}"
+    jac = _jaccard(q, n)
+    if jac >= jac_min:
+        return True, jac, f"字符相似度 {jac:.2f}"
+    return False, max(lcs_ratio, jac), f"太不像（子串比 {lcs_ratio:.2f}/相似度 {jac:.2f}）"
+
+
+def _gate_platform_candidates(keyword: str, found: list[dict],
+                              platform_label: str) -> list[dict]:
+    """对平台搜索返回的候选做相关度闸门；被滤掉的写进日志（含得分，便于以后调阈值）。"""
+    kept, dropped = [], []
+    for c in found:
+        name = c.get("title") or c.get("label") or ""
+        ok, score, why = relevance(keyword, name)
+        if ok:
+            kept.append(c)
+        else:
+            dropped.append((name, score, why))
+    if dropped:
+        log.info("相关度闸门（%s，查询=%r）：滤掉 %d 个 → %s", platform_label, keyword,
+                 len(dropped), "；".join(f"{n}={s:.2f}({w})" for n, s, w in dropped[:6]))
+    return kept
+
+
+# --------------------------------------------------------------------------- #
 # 查询归一化 & 预置源分档（P0 精度修复之一）
 #
 # 背景：原来判断"预置源命中"用的是纯子串匹配：
@@ -849,32 +980,42 @@ def search(query: str) -> dict:
     zhihu_ready = cookies.has_cookie("zhihu")
     weibo_ready = cookies.has_cookie("weibo")
 
+    # P0 精度闸门（一）：这看起来是"一句话"，不是"一个名字" → 不跑平台名字搜索。
+    # 平台搜索接口对任意字符串都会瞎给一批人（实测「今天天气不错」→「py今天天气不错」），
+    # 而用户看到候选就会点，点完就是"静默订错"。宁可干净失败 + 告诉他怎么给地址。
+    sentence_like = looks_like_sentence(keyword or query)
+    if sentence_like:
+        log.info("判为自由表述，跳过平台名字搜索：%r", query)
+
     if platform == "zhihu":
         try:
-            found = _zhihu_candidates(keyword)
+            found = [] if sentence_like else _zhihu_candidates(keyword)
         except Exception as exc:  # 登录失效这类问题要说清原因，不能笼统说"没搜到"
             return {"candidates": [], "hint": str(exc), "notes": notes}
-        if not found:
+        if not found and not sentence_like:
             return {"candidates": [], "hint": _needs_cookie_hint("zhihu", zhihu_ready),
                     "notes": notes}
-        candidates.extend(found)
+        candidates.extend(_gate_platform_candidates(keyword, found, "知乎"))
     elif platform == "weibo":
         try:
-            found = _weibo_candidates(keyword)
+            found = [] if sentence_like else _weibo_candidates(keyword)
         except Exception as exc:
             return {"candidates": [], "hint": str(exc), "notes": notes}
-        if not found:
+        if not found and not sentence_like:
             return {"candidates": [], "hint": _needs_cookie_hint("weibo", weibo_ready),
                     "notes": notes}
-        candidates.extend(found)
+        candidates.extend(_gate_platform_candidates(keyword, found, "微博"))
     elif platform == "wechat":
         return {"candidates": [], "hint": _needs_cookie_hint("wechat", False),
                 "notes": notes}
 
     if platform in (None, "bilibili"):
         candidates.extend(preset_exact)
-        found, err = _bilibili_candidates(keyword)
-        candidates.extend(found)
+        if sentence_like:
+            found, err = [], None
+        else:
+            found, err = _bilibili_candidates(keyword)
+        candidates.extend(_gate_platform_candidates(keyword, found, "B站"))
         if err:
             notes.append(err)
     elif platform not in ("zhihu", "weibo", "wechat"):
@@ -882,15 +1023,17 @@ def search(query: str) -> dict:
 
     # 没指定平台时，配了登录信息的平台也一起搜 —— 这就是原文档里
     # "找到以下相关源，请选择"的多平台候选效果
-    if platform is None:
+    if platform is None and not sentence_like:
         if zhihu_ready:
             try:
-                candidates.extend(_zhihu_candidates(keyword, limit=3))
+                candidates.extend(_gate_platform_candidates(
+                    keyword, _zhihu_candidates(keyword, limit=3), "知乎"))
             except Exception as exc:  # noqa: BLE001
                 notes.append(str(exc))
         if weibo_ready:
             try:
-                candidates.extend(_weibo_candidates(keyword, limit=3))
+                candidates.extend(_gate_platform_candidates(
+                    keyword, _weibo_candidates(keyword, limit=3), "微博"))
             except Exception as exc:  # noqa: BLE001
                 notes.append(str(exc))
 
@@ -916,6 +1059,11 @@ def search(query: str) -> dict:
         loose_unique.append(c)
 
     if not unique and not loose_unique:
+        if sentence_like:
+            # 自由表述：P0 不解决它，但必须"失败得体面"——明确说没读懂，并给出下一步
+            return {"candidates": [], "hint": (
+                f"「{query}」这句我没读出要订什么。可以直接给「平台 名字」"
+                f"（例如「B站 半佛仙人」），或者把 TA 的主页链接粘过来。"), "notes": notes}
         hint = f"没找到叫「{keyword}」的博主。" if keyword else "没找到相关源。"
         hint += "如果你知道 TA 的主页链接（例如 space.bilibili.com/12345），粘过来我就能订。"
         if platform in NEEDS_URL_HINT:

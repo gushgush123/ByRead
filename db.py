@@ -40,6 +40,12 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "auto_refresh_minutes": "30",           # 0 = 关闭自动刷新
     "page_size": "30",
     "sidebar_open": "true",                 # 侧边栏展开 / 收起
+    # 搜索精度（P0）：平台搜索结果的相关度闸门阈值 + "这看起来是句话、不是名字"的句式词表。
+    # 留空 = 用代码里的默认值（0.6 / 0.5 / 内置词表）。
+    # 调参方法：日志里「相关度闸门」那行会打出被滤掉的候选名与得分。
+    "search_relevance_lcs": "0.6",          # 最长公共子串 ÷ len(查询) 的下限
+    "search_relevance_jaccard": "0.5",      # 字符集合 Jaccard 相似度下限
+    "search_sentence_markers": "",          # 逗号分隔；命中则不去跑平台名字搜索
     # 监听地址（给将来的多端/托管留的口子）。环境变量 BYREAD_HOST / BYREAD_PORT 优先，
     # 默认仍然只监听本机 127.0.0.1:5000 —— 局域网也访问不到，这是有意的安全默认
     "bind_host": "127.0.0.1",
