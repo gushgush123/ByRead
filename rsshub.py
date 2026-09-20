@@ -156,7 +156,8 @@ PRESETS: list[dict] = [
     {
         "id": "codingnow",
         "label": "云风的 Blog",
-        "keys": ["云风", "codingnow"],
+        # 「云风的博客」是自然说法，算精确命中（否则会被判成"只是提到云风"而降级）
+        "keys": ["云风", "codingnow", "云风的博客", "云风的blog"],
         "kind": "direct",
         "feed_url": "https://blog.codingnow.com/atom.xml",
         "site_url": "https://blog.codingnow.com",
@@ -584,7 +585,7 @@ def _bilibili_candidate(mid: int) -> dict:
 
 
 def _route_candidate(label: str, detail: str, route: str, title: str,
-                     site_url: Optional[str], platform: str) -> dict:
+                     site_url: Optional[str], platform: str, match: str = "exact") -> dict:
     """需要实例拼路由的候选：feed_url 延迟到添加时解析，避免搜索阶段就卡在网络探测上。"""
     return {
         "label": f"{label} · {detail}",
@@ -595,10 +596,12 @@ def _route_candidate(label: str, detail: str, route: str, title: str,
         "site_url": site_url,
         "icon": None,
         "platform": platform,
+        "match": match,
     }
 
 
-def _preset_candidate(preset: dict) -> dict:
+def _preset_candidate(preset: dict, match: str = "exact") -> dict:
+    """match：exact = 用户就是要它；loose = 用户只是"提到了"这个平台（见 _preset_tier）"""
     if preset["kind"] == "direct":
         return {
             "label": preset["label"],
@@ -608,6 +611,7 @@ def _preset_candidate(preset: dict) -> dict:
             "site_url": preset.get("site_url"),
             "icon": None,
             "platform": preset["label"],
+            "match": match,
         }
     return _route_candidate(
         label=preset["label"],
@@ -616,6 +620,7 @@ def _preset_candidate(preset: dict) -> dict:
         title=preset["label"],
         site_url=preset.get("site_url"),
         platform=preset["label"],
+        match=match,
     )
 
 
@@ -658,21 +663,89 @@ def _fmt_fans(n: int) -> str:
     return str(n)
 
 
-def _preset_matches(platform: Optional[str], keyword: str) -> list[dict]:
-    """关键词命中平台名时，直接给出该平台的固定源。"""
-    text = (keyword or "").strip().lower()
+# --------------------------------------------------------------------------- #
+# 查询归一化 & 预置源分档（P0 精度修复之一）
+#
+# 背景：原来判断"预置源命中"用的是纯子串匹配：
+#     hit = any(k in text or text in k for k in preset["keys"])
+# 于是输入「豆瓣 租房小组」会命中「豆瓣电影正在上映」，还排在候选第一位。
+# 问题不在子串匹配本身，而在于**把"提到了这个平台"当成了"要订的就是这个源"**。
+#
+# 所以分成三档：
+#   A 精确   —— 归一化后正好等于它的名字/别名：用户就是在要它（少数派 / V2EX / 知乎日报…）
+#   B 提到   —— 别名只是查询的一部分（豆瓣 租房小组）：**不算命中**，
+#               降级到候选列表末尾 + 打标记 + 给一句人话说明
+#   C 未提及 —— 忽略
+# --------------------------------------------------------------------------- #
+_PUNCT_RE = re.compile(r"""[\s,，。、;；:：!！?？'"“”‘’()（）\[\]【】{}<>《》…—\-_·~`|/\\]+""")
+
+
+def _norm(text: str) -> str:
+    """归一化查询词：小写 + 去掉空白与常见中英文标点（用于"是不是同一个词"的判断）。"""
+    return _PUNCT_RE.sub("", (text or "").lower())
+
+
+def _preset_tier(query_norm: str, preset: dict) -> tuple[str, str, str, bool]:
+    """
+    判断预置源与查询的关系，返回 (档位, 涉及的名字, 剩下的部分, 是否"用户只打了半截")。
+
+    剩下的部分用于文案：输入「豆瓣 租房小组」+ 命中别名「豆瓣」→ 剩下「租房小组」，
+    于是可以说"没找到「租房小组」，你提到了「豆瓣」，我这儿只有「豆瓣电影正在上映」"。
+    partial=True 是反向情况（「少数」→「少数派」），文案要说"我这儿有个「少数派」"。
+    """
+    if not query_norm:
+        return "C", "", "", False
+    names = [preset["label"], *(preset.get("keys") or [])]
+
+    for name in names:                      # A：完全相等（含 label，例如「GitHub 每日趋势」）
+        if _norm(name) and _norm(name) == query_norm:
+            return "A", name, "", False
+
+    best: Optional[tuple[str, str, str, int, bool]] = None
+    for name in names:
+        n = _norm(name)
+        if not n:
+            continue
+        if n in query_norm and len(n) < len(query_norm):
+            # 平台名被提到，但后面还跟着别的东西 → 只是"提到"
+            score = len(n)
+            if best is None or score > best[3]:
+                best = ("B", name, query_norm.replace(n, "", 1), score, False)
+        elif query_norm in n and len(query_norm) < len(n):
+            # 反向：用户只打了半截（「少数」→「少数派」），也算提到
+            score = -len(n)
+            if best is None or score > best[3]:
+                best = ("B", name, query_norm, score, True)
+    if best:
+        return best[0], best[1], best[2], best[4]
+    return "C", "", "", False
+
+
+def _preset_matches(platform: Optional[str], keyword: str) -> tuple[list[dict], list[dict]]:
+    """
+    关键词匹配预置源。返回 (精确命中, 仅提及)。
+
+    指定了平台时只看该平台的预置源（"B站 热门"不会跑去找少数派）。
+    """
+    text = _norm(keyword)
     if not text:
-        return []
-    out = []
+        return [], []
+    exact: list[dict] = []
+    loose: list[dict] = []
     for preset in PRESETS:
-        if platform and platform not in (preset["id"], "sspai" if preset["id"] == "sspai" else preset["id"]):
-            # 指定了具体平台时，只在匹配的预置源里找
-            if platform != preset["id"]:
-                continue
-        hit = any(k.lower() in text or text in k.lower() for k in preset["keys"])
-        if hit:
-            out.append(_preset_candidate(preset))
-    return out
+        if platform and platform != preset["id"]:
+            continue
+        tier, name, rest, partial = _preset_tier(text, preset)
+        if tier == "A":
+            exact.append(_preset_candidate(preset))
+        elif tier == "B":
+            cand = _preset_candidate(preset, match="loose")
+            cand["mentioned"] = name
+            cand["unmatched"] = rest
+            cand["partial_query"] = partial
+            cand["detail"] = f"你提到的是「{name}」，这是「{preset['label']}」"
+            loose.append(cand)
+    return exact, loose
 
 
 def discover_candidates(page_url: str) -> list[dict]:
@@ -749,13 +822,11 @@ def search(query: str) -> dict:
             "notes": [],
         }
 
-    # 先做"整串精确命中预置源"的判断。
+    # 先做"整串精确命中预置源"的判断（A 档）。
     # 必须放在平台拆分之前：否则"知乎日报"会被当成"知乎 + 日报"，
     # 于是走到"知乎需要粘贴主页链接"的死胡同（实测踩过这个坑）。
-    normalized = query.lower()
-    exact_presets = [
-        p for p in PRESETS if normalized in [k.lower() for k in p["keys"]]
-    ]
+    query_norm = _norm(query)
+    exact_presets = [p for p in PRESETS if _preset_tier(query_norm, p)[0] == "A"]
     if exact_presets:
         return {
             "candidates": [_preset_candidate(p) for p in exact_presets],
@@ -770,7 +841,8 @@ def search(query: str) -> dict:
 
     # 固定平台 / 推荐源的命中结果排在前面：
     # 否则输入"少数派"时，B 站里同名的 UP 主会把这个网站挤到后面去。
-    preset_hits = _preset_matches(platform, keyword or query)
+    # preset_loose 只放在最后（用户"提到"了这个平台，但没说要订它）。
+    preset_exact, preset_loose = _preset_matches(platform, keyword or query)
 
     import cookies
 
@@ -800,13 +872,13 @@ def search(query: str) -> dict:
                 "notes": notes}
 
     if platform in (None, "bilibili"):
-        candidates.extend(preset_hits)
+        candidates.extend(preset_exact)
         found, err = _bilibili_candidates(keyword)
         candidates.extend(found)
         if err:
             notes.append(err)
     elif platform not in ("zhihu", "weibo", "wechat"):
-        candidates.extend(preset_hits)
+        candidates.extend(preset_exact)
 
     # 没指定平台时，配了登录信息的平台也一起搜 —— 这就是原文档里
     # "找到以下相关源，请选择"的多平台候选效果
@@ -832,15 +904,46 @@ def search(query: str) -> dict:
         seen.add(key)
         unique.append(c)
 
-    if not unique:
-        hint = "没找到相关源。可以换个说法，或者直接粘贴该博主的主页链接 / 网站的订阅地址"
+    # "只是提到"的预置源：排在精确候选**后面**，并带上人话说明。
+    # 它们不算命中 —— 用户可能只是顺口提了这个平台（实测：输入「豆瓣 租房小组」
+    # 原来会把「豆瓣电影正在上映」当命中端出去，用户订完才发现订错了）。
+    loose_unique = []
+    for c in preset_loose:
+        key = c.get("feed_url") or c.get("route") or c.get("label")
+        if key in seen:
+            continue
+        seen.add(key)
+        loose_unique.append(c)
+
+    if not unique and not loose_unique:
+        hint = f"没找到叫「{keyword}」的博主。" if keyword else "没找到相关源。"
+        hint += "如果你知道 TA 的主页链接（例如 space.bilibili.com/12345），粘过来我就能订。"
         if platform in NEEDS_URL_HINT:
             hint = _needs_cookie_hint(
                 platform, zhihu_ready if platform == "zhihu" else weibo_ready
             )
         return {"candidates": [], "hint": hint, "notes": notes}
 
-    return {"candidates": unique[:8], "hint": None, "notes": notes}
+    # 只有"提到"的候选时，**不能**说"已找到 N 个相关源"，要把话说清楚：
+    #   没找到「租房小组」。你提到了「豆瓣」，我这儿只有「豆瓣电影正在上映」——要订这个吗？
+    hint = None
+    if loose_unique and not unique:
+        first = loose_unique[0]
+        mentioned = first.get("mentioned") or ""
+        rest = first.get("unmatched") or ""
+        if first.get("partial_query"):
+            # 用户只打了半截（「少数」→「少数派」）
+            hint = f"没找到「{rest}」。我这儿有个「{first['label']}」——要订这个吗？"
+        elif _norm(mentioned) == _norm(first.get("title") or ""):
+            # 提到的就是源名本身（「掘金 前端」+「掘金」），别重复说两遍
+            hint = f"没找到「{rest}」。我这儿有「{first['label']}」——要订这个吗？"
+        else:
+            hint = (f"没找到「{rest}」。你提到了「{mentioned}」，"
+                    f"我这儿只有「{first['label']}」——要订这个吗？")
+        if len(loose_unique) > 1:
+            hint += f"（另有 {len(loose_unique) - 1} 个相关源，都在下面）"
+
+    return {"candidates": (unique + loose_unique)[:8], "hint": hint, "notes": notes}
 
 
 def presets_for_ui() -> list[dict]:

@@ -697,9 +697,12 @@
         main.className = 'candidate__main';
         const label = document.createElement('div');
         label.className = 'candidate__label';
-        label.textContent = c.label + (c.subscribed ? '（已订阅）' : '');
+        // loose = 用户只是"提到了"这个平台、并不确定要订它（例如输入「豆瓣 租房小组」）
+        // 必须打上标记，否则用户会以为这就是他要的那个，点下去就是"静默订错"
+        label.textContent = (c.match === 'loose' ? '⚠ 不确定 · ' : '') + c.label
+          + (c.subscribed ? '（已订阅）' : '');
         const detail = document.createElement('div');
-        detail.className = 'candidate__detail';
+        detail.className = 'candidate__detail' + (c.match === 'loose' ? ' candidate__detail--warn' : '');
         detail.textContent = c.detail || '';
         main.appendChild(label);
         if (c.detail) main.appendChild(detail);
