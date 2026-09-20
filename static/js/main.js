@@ -1061,6 +1061,15 @@
     ByRead.openSubscribe();
   });
 
+  // 顶栏的 ✨：用一句话描述也能订（本地 AI 兜底）。预填一句示例 + 直接让 AI 猜，
+  // 这样第一次点的人立刻能看到"AI 理解成了什么、猜的候选长什么样"。
+  const aiBtn = document.getElementById('btn-ai');
+  if (aiBtn) {
+    aiBtn.addEventListener('click', function () {
+      ByRead.openSubscribeWith('帮我订阅半佛仙人', { ai: true });
+    });
+  }
+
   document.getElementById('btn-view-mode').addEventListener('click', function () {
     const next = VIEW_CYCLE[(VIEW_CYCLE.indexOf(state.viewMode) + 1) % VIEW_CYCLE.length];
     state.viewMode = next;

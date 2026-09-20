@@ -128,8 +128,9 @@ def run_offline() -> tuple[bool, list[str]]:
             raise requests.Timeout("stub")
         ai._chat = boom_timeout  # noqa: SLF001
         got = ai.interpret("随便说点什么")
-        ok = (not got["ok"]) and "太慢" in (got["error"] or "")
-        lines.append(f"  {'✅' if ok else '❌'} 超时 → ok={got['ok']} error={got['error']!r}")
+        err = got["error"] or ""
+        ok = (not got["ok"]) and ("太慢" in err or "还没加载完" in err)
+        lines.append(f"  {'✅' if ok else '❌'} 超时 → ok={got['ok']} error={err!r}")
         if not ok:
             fails.append("interpret 超时处理不对")
 

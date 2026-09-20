@@ -3,9 +3,10 @@
   "private": true,
   "description": "白读的前端回归测试（jsdom 里加载真实页面与真实 JS，跑真实服务）",
   "scripts": {
-    "test": "node channel.test.js && node image.test.js && node channel_monkey.test.js",
+    "test": "node channel.test.js && node image.test.js && node channel_monkey.test.js && node loose_fold.test.js",
     "monkey": "node channel_monkey.test.js",
-    "image": "node image.test.js"
+    "image": "node image.test.js",
+    "loose": "node loose_fold.test.js"
   },
   "devDependencies": {
     "jsdom": "^29.0.0"

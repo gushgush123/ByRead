@@ -634,6 +634,11 @@
     let candidates = [];
     let selectedIndex = -1;
     let busy = false;
+    // loose（不确定）候选默认收起：只由两道闸门判过的确定候选才直接可见。
+    // 这是 P0 精度的产品化 —— AI 猜的、以及"只是提到这个平台"的候选都在折叠区里。
+    let looseOpen = false;
+    let aiInfo = null;        // 上一次搜索里 AI 那部分（可能没有）
+    let aiAvailable = true;   // 服务端告诉前端：这台机器上 AI 能不能用
 
     function open() {
       mask.classList.add('is-open');
@@ -644,12 +649,15 @@
     }
     ByRead.openSubscribe = open;
     ByRead.closeSubscribe = close;
-    /** 带上关键词直接打开并搜索（设置页的"查找并添加"用） */
-    ByRead.openSubscribeWith = function (query) {
+    /**
+     * 带上关键词直接打开并搜索（设置页的"查找并添加"、首页的 ✨ 入口都用它）
+     * opts.ai = true 时连 AI 一起叫 —— 首页那个 ✨ 按钮：用户点它就是想看 AI 怎么猜
+     */
+    ByRead.openSubscribeWith = function (query, opts) {
       open();
       if (query) {
         input.value = query;
-        doSearch();
+        doSearch(!!(opts && opts.ai));
       }
     };
 
@@ -661,57 +669,159 @@
       if (e.key === 'Escape' && mask.classList.contains('is-open')) close();
     });
 
-    function renderCandidates() {
+    /** 一个候选行（确定候选和折叠区里的候选共用一套渲染） */
+    function candidateRow(c, index) {
+      const row = document.createElement('label');
+      row.className = 'candidate'
+        + (c.subscribed ? ' is-disabled' : '')
+        + (index === selectedIndex ? ' is-selected' : '');
+
+      const radio = document.createElement('input');
+      radio.type = 'radio';
+      radio.name = 'candidate';
+      radio.checked = index === selectedIndex;
+      radio.disabled = !!c.subscribed;
+      radio.addEventListener('change', function () {
+        selectedIndex = index;
+        renderResults();
+      });
+
+      let icon;
+      if (c.icon) {
+        icon = document.createElement('img');
+        icon.className = 'candidate__icon';
+        icon.src = ByRead.imageUrl(c.icon);
+        icon.alt = '';
+        icon.referrerPolicy = 'no-referrer';
+        icon.onerror = function () { icon.replaceWith(fallbackIcon(c)); };
+      } else {
+        icon = fallbackIcon(c);
+      }
+
+      const main = document.createElement('div');
+      main.className = 'candidate__main';
+      const label = document.createElement('div');
+      label.className = 'candidate__label';
+      // loose = 不确定：AI 猜的，或者用户只是"提到了"这个平台（例如输入「豆瓣 租房小组」）。
+      // 必须打上标记，否则用户会以为这就是他要的那个，点下去就是"静默订错"
+      label.textContent = (c.match === 'loose' ? '⚠ 不确定 · ' : '') + c.label
+        + (c.subscribed ? '（已订阅）' : '');
+      const detail = document.createElement('div');
+      detail.className = 'candidate__detail' + (c.match === 'loose' ? ' candidate__detail--warn' : '');
+      detail.textContent = c.detail || '';
+      main.appendChild(label);
+      if (c.detail) main.appendChild(detail);
+
+      row.appendChild(radio);
+      row.appendChild(icon);
+      row.appendChild(main);
+      return row;
+    }
+
+    /** loose 候选的折叠区：默认收起，点一下才展开 */
+    function looseGroup(rows) {
+      const wrap = document.createElement('div');
+      wrap.className = 'loose-group';
+      const toggle = document.createElement('button');
+      toggle.type = 'button';
+      toggle.className = 'loose-group__toggle';
+      toggle.id = 'loose-toggle';
+      toggle.textContent = (looseOpen ? '▾ 收起 ' : '▸ 展开 ') + rows.length
+        + ' 个不确定的候选（AI 猜的 / 只是提到了某个平台）';
+      toggle.addEventListener('click', function () {
+        looseOpen = !looseOpen;
+        renderResults();
+      });
+      wrap.appendChild(toggle);
+      if (looseOpen) {
+        const body = document.createElement('div');
+        body.className = 'loose-group__body';
+        rows.forEach(function (pair) { body.appendChild(candidateRow(pair[0], pair[1])); });
+        wrap.appendChild(body);
+      }
+      return wrap;
+    }
+
+    /** AI 那部分：它理解成了什么 + 让它再搜一次；没有候选时给一个 ✨ 入口 */
+    function renderAi(hasVisible, hasLoose) {
+      const used = !!(aiInfo && aiInfo.used);
+      if (used) {
+        const box = document.createElement('div');
+        box.className = 'ai-box';
+        const title = document.createElement('div');
+        title.className = 'ai-box__title';
+        const what = (aiInfo.platform_label && aiInfo.keyword)
+          ? aiInfo.platform_label + ' · ' + aiInfo.keyword
+          : (aiInfo.rewritten || '没看出具体要订谁');
+        title.textContent = '✨ 本地 AI 的理解：' + what
+          + (aiInfo.reason ? '（' + aiInfo.reason + '）' : '');
+        box.appendChild(title);
+
+        const meta = document.createElement('div');
+        meta.className = 'ai-box__meta';
+        const bits = [];
+        if (aiInfo.elapsed_ms) bits.push('本地模型用时 ' + (aiInfo.elapsed_ms / 1000).toFixed(1) + ' 秒');
+        if (aiInfo.cold) bits.push('模型刚启动，第一次会慢一点');
+        meta.textContent = bits.join('　');
+        if (meta.textContent) box.appendChild(meta);
+
+        const actions = document.createElement('div');
+        actions.className = 'ai-box__actions';
+        if (aiInfo.rewritten) {
+          const use = document.createElement('button');
+          use.type = 'button';
+          use.className = 'btn btn--sm';
+          use.id = 'ai-use-btn';
+          use.textContent = '用它再搜一次';
+          use.title = '把「' + aiInfo.rewritten + '」当成搜索词，走正常的搜索（会重新过两道闸门）';
+          use.addEventListener('click', function () {
+            input.value = aiInfo.rewritten;
+            doSearch(false);
+          });
+          actions.appendChild(use);
+        }
+        const nope = document.createElement('button');
+        nope.type = 'button';
+        nope.className = 'btn btn--ghost btn--sm';
+        nope.textContent = '不对，我换个说法';
+        nope.addEventListener('click', function () { input.focus(); input.select(); });
+        actions.appendChild(nope);
+        box.appendChild(actions);
+        resultsBox.appendChild(box);
+      }
+
+      // 一个候选都没有、AI 又能用时：给一个显眼的入口（用户自己决定要不要让它猜）
+      if (!hasVisible && !hasLoose && aiAvailable) {
+        const box = document.createElement('div');
+        box.className = 'ai-box ai-box--cta';
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'ai-fallback__btn';
+        btn.id = 'ai-fallback-btn';
+        btn.textContent = used ? '✨ 再让本地 AI 猜一次' : '✨ 让本地 AI 猜一下';
+        btn.addEventListener('click', function () { doSearch(true); });
+        box.appendChild(btn);
+        const note = document.createElement('div');
+        note.className = 'ai-box__meta';
+        note.textContent = '用这台电脑上的小模型理解这句话（不联网、内容不出本机）。'
+          + '它猜出来的候选会标成「不确定」并收起来，需要你点开确认。';
+        box.appendChild(note);
+        resultsBox.appendChild(box);
+      }
+    }
+
+    /** 重画结果区：确定候选直接可见，loose 候选在折叠区里 */
+    function renderResults() {
       resultsBox.innerHTML = '';
       addBtn.disabled = selectedIndex < 0;
-      if (!candidates.length) return;
-      candidates.forEach(function (c, index) {
-        const row = document.createElement('label');
-        row.className = 'candidate'
-          + (c.subscribed ? ' is-disabled' : '')
-          + (index === selectedIndex ? ' is-selected' : '');
-
-        const radio = document.createElement('input');
-        radio.type = 'radio';
-        radio.name = 'candidate';
-        radio.checked = index === selectedIndex;
-        radio.disabled = !!c.subscribed;
-        radio.addEventListener('change', function () {
-          selectedIndex = index;
-          renderCandidates();
-        });
-
-        let icon;
-        if (c.icon) {
-          icon = document.createElement('img');
-          icon.className = 'candidate__icon';
-          icon.src = ByRead.imageUrl(c.icon);
-          icon.alt = '';
-          icon.referrerPolicy = 'no-referrer';
-          icon.onerror = function () { icon.replaceWith(fallbackIcon(c)); };
-        } else {
-          icon = fallbackIcon(c);
-        }
-
-        const main = document.createElement('div');
-        main.className = 'candidate__main';
-        const label = document.createElement('div');
-        label.className = 'candidate__label';
-        // loose = 用户只是"提到了"这个平台、并不确定要订它（例如输入「豆瓣 租房小组」）
-        // 必须打上标记，否则用户会以为这就是他要的那个，点下去就是"静默订错"
-        label.textContent = (c.match === 'loose' ? '⚠ 不确定 · ' : '') + c.label
-          + (c.subscribed ? '（已订阅）' : '');
-        const detail = document.createElement('div');
-        detail.className = 'candidate__detail' + (c.match === 'loose' ? ' candidate__detail--warn' : '');
-        detail.textContent = c.detail || '';
-        main.appendChild(label);
-        if (c.detail) main.appendChild(detail);
-
-        row.appendChild(radio);
-        row.appendChild(icon);
-        row.appendChild(main);
-        resultsBox.appendChild(row);
+      const visible = [];
+      const loose = [];
+      candidates.forEach(function (c, i) {
+        (c.match === 'loose' ? loose : visible).push([c, i]);
       });
+      renderAi(visible.length > 0, loose.length > 0);
+      visible.forEach(function (pair) { resultsBox.appendChild(candidateRow(pair[0], pair[1])); });
+      if (loose.length) resultsBox.appendChild(looseGroup(loose));
     }
 
     function fallbackIcon(c) {
@@ -721,31 +831,53 @@
       return span;
     }
 
-    async function doSearch() {
+    async function doSearch(useAi) {
       const q = input.value.trim();
       if (!q || busy) return;
+      const askedAi = !!useAi;
       busy = true;
       searchBtn.disabled = true;
-      searchBtn.textContent = '查找中';
-      resultsBox.innerHTML = '<div class="modal__hint">正在查找…</div>';
+      searchBtn.textContent = askedAi ? 'AI 猜…' : '查找中';
+      resultsBox.innerHTML = '<div class="modal__hint">'
+        + (askedAi ? '本地 AI 正在理解这句话…（第一次可能要十几秒，之后就快了）' : '正在查找…')
+        + '</div>';
       hintBox.textContent = '';
       candidates = [];
       selectedIndex = -1;
+      aiInfo = null;
       addBtn.disabled = true;
       try {
-        const data = await ByRead.api('POST', '/api/search', { q: q });
+        const payload = { q: q };
+        if (askedAi) payload.ai = true;      // 用户自己按的 ✨ → 让服务端一定走 AI
+        const data = await ByRead.api('POST', '/api/search', payload);
         candidates = data.candidates || [];
-        // 只有一个结果就直接选中，减少一次点击
-        if (candidates.length === 1 && !candidates[0].subscribed) selectedIndex = 0;
-        renderCandidates();
-        if (!candidates.length) {
-          hintBox.textContent = data.hint || '没找到相关源';
+        aiInfo = data.ai || null;
+        aiAvailable = data.ai_available !== false;
+        // 用户主动点的 ✨：他就是要看 AI 猜的东西，直接展开；正常搜索一律收起
+        looseOpen = askedAi;
+        const visible = candidates.filter(function (c) { return c.match !== 'loose'; });
+        const loose = candidates.length - visible.length;
+        // 只有一个**确定**结果就直接选中，减少一次点击（loose 的不自动选，用户还没看见它）
+        if (visible.length === 1 && !visible[0].subscribed) {
+          selectedIndex = candidates.indexOf(visible[0]);
+        }
+        renderResults();
+
+        if (askedAi && loose) {
+          hintBox.textContent = '本地 AI 猜了 ' + loose
+            + ' 个候选（已展开在下面「不确定」里 —— 确认是你要的再添加）。';
         } else if (data.hint) {
-          hintBox.textContent = data.hint;
+          hintBox.textContent = data.hint
+            + ((!visible.length && loose) ? '（不确定的候选已收起，点下面的「展开」能看到）' : '');
+        } else if (!candidates.length) {
+          hintBox.textContent = '没找到相关源';
+        } else if (!visible.length) {
+          hintBox.textContent = '没有能确定下来的源，但有 ' + loose
+            + ' 个不确定的候选（已收起，展开看看？）';
         } else {
-          hintBox.textContent = candidates.length === 1
+          hintBox.textContent = visible.length === 1
             ? '找到 1 个相关源，可以直接添加'
-            : '已找到 ' + candidates.length + ' 个相关源，请选择';
+            : '已找到 ' + visible.length + ' 个相关源，请选择';
         }
         if (data.notes && data.notes.length) {
           hintBox.textContent += '（' + data.notes.join('；') + '）';
@@ -783,10 +915,12 @@
       }
     }
 
-    searchBtn.addEventListener('click', doSearch);
+    // 注意：不能直接把 doSearch 当事件处理器 —— 事件对象会被当成 useAi 传进去，
+    // 于是每次点「查找」都会强制走 AI（实测踩过这个坑）
+    searchBtn.addEventListener('click', function () { doSearch(false); });
     addBtn.addEventListener('click', doAdd);
     input.addEventListener('keydown', function (e) {
-      if (e.key === 'Enter') { e.preventDefault(); doSearch(); }
+      if (e.key === 'Enter') { e.preventDefault(); doSearch(false); }
     });
 
     if (options.autoOpen) open();

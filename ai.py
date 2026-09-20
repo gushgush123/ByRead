@@ -78,7 +78,8 @@ _SYSTEM_PROMPT = (
 
 # 冷启动实测 11s（加载 2.5GB 模型），热了 2.7~4.2s。启动时预热一次，
 # 之后 status() 就能告诉用户"已就绪"还是"还没热"。
-_STATE: dict = {"warm_at": 0.0, "warm_ms": 0, "warm_ok": False, "detail": "还没预热"}
+_STATE: dict = {"warm_at": 0.0, "warm_ms": 0, "warm_ok": False, "detail": "还没预热",
+                "warming": False}
 _warm_lock = threading.Lock()
 
 _SNIPPET_MAX = 40          # 模型给的 keyword/query 长度上限（防止它把整句塞进来）
@@ -242,6 +243,7 @@ def status(probe: bool = True, wait: Optional[float] = None) -> dict:
         "model_present": False,   # 模型下没下
         "models": [],
         "warmed": bool(_STATE.get("warm_at")),
+        "warming": bool(_STATE.get("warming")),
         "warm_ms": int(_STATE.get("warm_ms") or 0),
         "warm_ok": bool(_STATE.get("warm_ok")),
         "detail": str(_STATE.get("detail") or ""),
@@ -292,18 +294,29 @@ def warm_up() -> dict:
         return {"ok": False, "detail": str(exc)}
 
 
-def start_prewarm() -> None:
-    """启动时叫一次，把冷启动那 5~11 秒挪到用户看不见的地方。失败就失败，绝不抛。"""
+def start_prewarm() -> bool:
+    """
+    起一个后台线程把模型加载起来（启动时叫一次；冷启动超时后也会再叫一次）。
+    已经在预热就直接返回 False，免得用户连点起一堆线程。失败绝不上抛。
+    """
     if not (enabled() and prewarm_enabled()):
-        return
+        return False
+    with _warm_lock:
+        if _STATE.get("warming"):
+            return False
+        _STATE["warming"] = True
 
     def worker():
         try:
             warm_up()
         except Exception as exc:  # noqa: BLE001
             log.info("预热线程异常（忽略）：%s", exc)
+        finally:
+            with _warm_lock:
+                _STATE["warming"] = False
 
     threading.Thread(target=worker, name="byread-ai-prewarm", daemon=True).start()
+    return True
 
 
 def interpret(query: str) -> dict:
@@ -329,7 +342,14 @@ def interpret(query: str) -> dict:
         content = _chat([{"role": "system", "content": _SYSTEM_PROMPT},
                          {"role": "user", "content": query[:200]}], wait=timeout())
     except requests.Timeout:
-        out["error"] = f"本地模型太慢（超过 {timeout():.0f} 秒没回话），稍后再试一次"
+        # 冷启动实测 11 秒 > 默认 6 秒预算 —— 第一次点很可能就撞在这个超时上。
+        # 这时候顺手在后台把它加载起来，并明确告诉用户"不是坏了，是在加载"。
+        out["cold"] = not bool(_STATE.get("warm_at"))
+        if out["cold"] and start_prewarm():
+            out["error"] = (f"本地模型还没加载完（超过 {timeout():.0f} 秒没回话）。"
+                            "已经在后台加载了，十几秒后再点一次就快了")
+        else:
+            out["error"] = f"本地模型太慢（超过 {timeout():.0f} 秒没回话），稍后再试一次"
     except requests.ConnectionError:
         out["error"] = f"连不上本地模型（{base_url()} 没在跑？）"
     except Exception as exc:  # noqa: BLE001
