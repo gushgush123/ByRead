@@ -3,10 +3,17 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey)
+![Made with DeepSeek](https://img.shields.io/badge/Made%20with-DeepSeek-4D6BFE)
+![vibe coding](https://img.shields.io/badge/vibe%20coding-%23dsh-8A2BE2)
 
 给自己用的本地 RSS 阅读器。数据全在你自己的电脑上，不需要登录，没有推荐流，没有广告。
 
 **核心体验**：你在一个输入框里输入博主名或平台名，它自己找到对应的源并开始抓文章。全程不出现"RSS""路由""订阅地址"这些词。
+
+> 🤖 **本项目全程 vibe coding**：从需求文档到实现、排障、重构，全部由 **DeepSeek** 在 **DeepSeek Harness**
+> 中对话式完成，没有手写代码。详见 → [这个项目是怎么做出来的](#十四这个项目是怎么做出来的)
+>
+> `#dsh` `#DeepSeek` `#vibecoding` `#RSS`
 
 ---
 
@@ -926,6 +933,49 @@ ByRead/
 
 `static/vendor/purify.min.js` 是随本项目一起分发的第三方文件，其版权归原作者所有，
 遵循其自身的许可证。
+
+---
+
+## 十四、这个项目是怎么做出来的
+
+**全程 vibe coding，没有手写一行代码。**
+
+起点是一份中文需求文档，之后的设计、编码、排障、重构，全部由 **DeepSeek** 在 **DeepSeek Harness**
+里通过对话完成。作者做的事情是提需求、点验收、报 bug。
+
+- **模型**：DeepSeek
+- **开发环境**：DeepSeek Harness（DSH）
+- **开发方式**：vibe coding —— 需求 → 实现 → 实测 → 反馈 → 修
+
+### 这种方式下最明显的一个特点：先验证，再实现
+
+这个项目最花时间的不是写代码，而是**确认外部依赖到底能不能用**。全程没有"照着文档写"就算完的：
+
+| 原本以为 | 实测发现 | 结果 |
+|---|---|---|
+| RSSHub 公共实例可以搜博主 | `rsshub.app` 在这台机器上完全不通 | B 站改成原生实现（自己算 wbi 签名） |
+| 知乎用户动态接口可用 | 该接口对任何账号都返回空数组（已废） | 改用 answers / articles / pins 三接口合并 |
+| 图片直接放 URL 就行 | 微博、B 站图床有防盗链，浏览器从 `127.0.0.1` 请求被判 403 | 加本地图片代理，按域名带正确 Referer |
+| 机核有 RSS 就能抓 | 它的 RSS 被 WAF 拦，时好时坏 | 改走官方 JSON API |
+| `start.bat` 双击就能跑 | 文件是 UTF-8 + LF，cmd 按 GBK 解析后整行错位 | 改成 GBK + CRLF，并用 `.gitattributes` 锁死 |
+
+这些结论都写在[更新记录](#七更新记录)里，连同当时的验证方式和数据。
+
+### 测试抓出过不少"自己造的 bug"
+
+比较典型的两个（细节见更新记录）：
+
+- `init_db()` 里**先建索引、后补列**，老库升级时直接抛错退出，导致所有查询失败而异常被吞掉 ——
+  界面显示 **0 篇文章**（数据其实完好）。
+- 列表页的 `load()` **没有丢弃过期响应**，快速连点「全部 / 未读 / 星标」时，
+  先发的慢响应会覆盖后发的快响应，**列表内容和侧边栏高亮不一致**。
+
+后一个最终固化成了一套可复跑的前端回归测试（jsdom + 注入随机延迟 + 猴子测试），
+把"旧响应晚回来"变成确定性场景，不靠手速复现。
+
+### 标签
+
+`#dsh` `#DeepSeek` `#vibecoding` `#RSS` `#Python` `#Flask` `#SQLite` `#自用工具`
 
 ---
 
